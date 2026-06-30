@@ -2,9 +2,12 @@ name: Auto Update WiraAvia Map
 
 on:
   schedule:
-    # Perintah ini akan menjalankan script setiap 30 menit (menit ke-15 dan 45)
     - cron: '15,45 * * * *'
-  workflow_dispatch: # Mengizinkan kita untuk memicu robot ini secara manual
+  workflow_dispatch:
+
+# BARIS INI SANGAT PENTING AGAR ROBOT DIIZINKAN MENYIMPAN FILE INDEX.HTML
+permissions:
+  contents: write
 
 jobs:
   build:
