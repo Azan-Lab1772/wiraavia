@@ -1,0 +1,35 @@
+name: Auto Update WiraAvia Map
+
+on:
+  schedule:
+    # Perintah ini akan menjalankan script setiap 30 menit (menit ke-15 dan 45)
+    - cron: '15,45 * * * *'
+  workflow_dispatch: # Mengizinkan kita untuk memicu robot ini secara manual
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Tarik Data Repository
+        uses: actions/checkout@v3
+
+      - name: Siapkan Lingkungan Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Modul (Requirements)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Eksekusi WiraAvia Engine
+        run: python main.py
+
+      - name: Simpan (Commit) & Push Perubahan ke index.html
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add index.html
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update Peta WiraAvia" && git push)
