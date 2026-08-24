@@ -5,8 +5,22 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import io
+import os
+import webbrowser
+import time
 import re
+import base64
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ==========================================
+# KONFIGURASI GITHUB UPLOADER & TELEGRAM
+# ==========================================
+GITHUB_TOKEN = os.getenv('MY_GITHUB_TOKEN')
+GITHUB_REPO = 'Azan-Lab1772/wiraavia'
+
+TELEGRAM_BOT_TOKEN = os.getenv('TELE_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELE_CHAT_ID')
 
 # ==========================================
 # 1. LOAD DATA STASIUN BANDARA
@@ -40,40 +54,30 @@ data_csv = """No,ICAO,Nama_Bandara,Lintang,Bujur,WMO
 27,WAJJ,SENTANI,-2.571812, 140.512298,97690
 28,WAVV,WAMENA,-4.097578, 138.952653,97686
 29,WAKK,MOPAH,-8.521111, 140.416944,97980"""
-
 df_bandara = pd.read_csv(io.StringIO(data_csv))
 
 # ==========================================
-# 2. PERSIAPAN KONEKSI API (SUPER STEALTH HEADERS)
+# 2. FUNGSI TARIK DATA BMKG (TIDAK DIUBAH)
 # ==========================================
-TOKEN = '37da31a5cc6f0732732a7f9c640507b2849e37a3b815b0252af2a54afc7a'
-
-# Meniru request dari browser Indonesia (Bypass WAF BMKG)
+API_TOKEN = '37da31a5cc6f0732732a7f9c640507b2849e37a3b815b0252af2a54afc7a'
 HEADERS = {
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Authorization': f'Bearer {TOKEN}',
-    'Connection': 'keep-alive',
-    'Origin': 'https://web-aviation.bmkg.go.id',
-    'Referer': 'https://web-aviation.bmkg.go.id/',
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'same-origin',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    'accept': '*/*', 
+    'Authorization': f'Bearer {API_TOKEN}',
+    'Connection': 'close',
+    'User-Agent': 'Mozilla/5.0'
 }
 
 session = requests.Session()
 session.headers.update(HEADERS)
-# Perpanjang waktu retry jika koneksi dari US ditolak sementara
-retry_strategy = Retry(total=5, backoff_factor=2, status_forcelist=[403, 429, 500, 502, 503, 504])
+retry_strategy = Retry(total=5, backoff_factor=1.5, status_forcelist=[403, 429, 500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 
-def get_weather_data(icao, data_type, count=45):
+def get_weather_data(icao, data_type, count=30):
     url = f"https://web-aviation.bmkg.go.id/api/v1/{data_type}/{icao.lower()}"
     try:
-        response = session.get(url, timeout=15) # Tambah timeout
+        response = session.get(url, timeout=10)
         if response.status_code == 200:
             try:
                 data = response.json()
@@ -84,10 +88,197 @@ def get_weather_data(icao, data_type, count=45):
                     if isinstance(weather_list, list) and len(weather_list) > 0:
                         return [w.get('data_text', "") for w in weather_list[:count]]
             except ValueError: pass
-    except Exception as e: 
-        print(f"Gagal menarik {icao}: {e}") # Log error di Actions
+    except Exception: pass
     return []
 
+# ==========================================
+# 3. FUNGSI ASISTEN NWP (LOGIKA AI CERDAS BERBASIS PARAMETER & ARAH)
+# ==========================================
+def terjemah_wx(kode):
+    if kode in [95, 96, 99]: return "TSRA ⚡"
+    elif kode in [61, 63, 65, 66, 67]: return "RA 🌧️"
+    elif kode in [45, 48]: return "FG 🌫️"
+    elif kode in [51, 53, 55]: return "DZ 💧"
+    elif kode in [0, 1, 2, 3]: return "NSW ⛅"
+    else: return f"Kode {kode}"
+
+def get_nwp_forecast(lat, lon, status_color, l2_reasons):
+    url = (f"https://api.open-meteo.com/v1/forecast?"
+           f"latitude={lat}&longitude={lon}&"
+           f"hourly=pressure_msl,weather_code,wind_speed_10m,wind_direction_10m&"
+           f"models=ecmwf_ifs025,gfs_seamless,icon_global&timezone=UTC&wind_speed_unit=kn")
+    try:
+        res = requests.get(url, headers={'User-Agent': 'WiraAvia'}, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            if 'hourly' not in data: 
+                return "Data model tidak tersedia.", "Data NWP Kosong."
+            
+            hourly = data['hourly']
+            waktu_full = hourly.get('time', [])
+            if not waktu_full:
+                return "Waktu prediksi tidak tersedia.", "Data Waktu Kosong."
+            
+            now_utc = datetime.now(timezone.utc)
+            current_hour_str = now_utc.strftime("%Y-%m-%dT%H:00")
+            start_idx = next((i for i, t in enumerate(waktu_full) if t >= current_hour_str), 0)
+            
+            waktu = waktu_full[start_idx : start_idx+3]
+            null_array = [None] * len(waktu_full)
+
+            qnh_ec = hourly.get('pressure_msl_ecmwf_ifs025', null_array)[start_idx:start_idx+3]
+            qnh_gf = hourly.get('pressure_msl_gfs_seamless', null_array)[start_idx:start_idx+3]
+            qnh_ic = hourly.get('pressure_msl_icon_global', null_array)[start_idx:start_idx+3]
+            
+            wx_ec = hourly.get('weather_code_ecmwf_ifs025', null_array)[start_idx:start_idx+3]
+            wx_gf = hourly.get('weather_code_gfs_seamless', null_array)[start_idx:start_idx+3]
+            wx_ic = hourly.get('weather_code_icon_global', null_array)[start_idx:start_idx+3]
+
+            ws_ec = hourly.get('wind_speed_10m_ecmwf_ifs025', null_array)[start_idx:start_idx+3]
+            ws_gf = hourly.get('wind_speed_10m_gfs_seamless', null_array)[start_idx:start_idx+3]
+            ws_ic = hourly.get('wind_speed_10m_icon_global', null_array)[start_idx:start_idx+3]
+
+            wd_ec = hourly.get('wind_direction_10m_ecmwf_ifs025', null_array)[start_idx:start_idx+3]
+            wd_gf = hourly.get('wind_direction_10m_gfs_seamless', null_array)[start_idx:start_idx+3]
+            wd_ic = hourly.get('wind_direction_10m_icon_global', null_array)[start_idx:start_idx+3]
+
+            html_out, tg_out = "", ""
+            trend_cuaca = []
+            
+            for i in range(len(waktu)):
+                jam = waktu[i][-5:]
+                
+                def get_val(arr, fmt, is_wx=False):
+                    if i < len(arr) and arr[i] is not None:
+                        return terjemah_wx(arr[i]) if is_wx else f"{arr[i]:{fmt}}"
+                    return "N/A"
+                def get_wind(wd_arr, ws_arr):
+                    if i < len(wd_arr) and wd_arr[i] is not None and i < len(ws_arr) and ws_arr[i] is not None:
+                        return f"{wd_arr[i]:03.0f}/{ws_arr[i]:.0f}KT"
+                    return "N/A"
+
+                q_e, q_u, q_i = get_val(qnh_ec, '.1f'), get_val(qnh_gf, '.1f'), get_val(qnh_ic, '.1f')
+                w_e, w_u, w_i = get_val(wx_ec, '', True), get_val(wx_gf, '', True), get_val(wx_ic, '', True)
+                wind_e, wind_u, wind_i = get_wind(wd_ec, ws_ec), get_wind(wd_gf, ws_gf), get_wind(wd_ic, ws_ic)
+
+                bad_votes, total_votes = 0, 0
+                for wx_arr, ws_arr in [(wx_ec, ws_ec), (wx_gf, ws_gf), (wx_ic, ws_ic)]:
+                    if i < len(wx_arr) and wx_arr[i] is not None:
+                        total_votes += 1
+                        is_bad_wx = wx_arr[i] >= 45
+                        is_bad_wind = (i < len(ws_arr) and ws_arr[i] is not None and ws_arr[i] >= 15)
+                        if is_bad_wx or is_bad_wind: bad_votes += 1
+                
+                if total_votes > 0 and bad_votes > (total_votes / 2): trend_cuaca.append("BAD")
+                else: trend_cuaca.append("GOOD")
+
+                html_out += f"<span style='color:#0056b3; font-weight:bold;'>{jam} UTC</span><br>"
+                html_out += f"🇪🇺 ECMWF : {wind_e} | QNH {q_e} | {w_e}<br>"
+                html_out += f"🇺🇸 GFS&nbsp;&nbsp;&nbsp;: {wind_u} | QNH {q_u} | {w_u}<br>"
+                html_out += f"🇩🇪 ICON&nbsp;&nbsp;: {wind_i} | QNH {q_i} | {w_i}<br>"
+                if i < len(waktu) - 1: html_out += "<br>"
+                
+                tg_out += f"🕒 <b>{jam} UTC</b>\n"
+                tg_out += f"🇪🇺 ECMWF: {wind_e} | QNH {q_e} | {w_e}\n"
+                tg_out += f"🇺🇸 GFS  : {wind_u} | QNH {q_u} | {w_u}\n"
+                tg_out += f"🇩🇪 ICON : {wind_i} | QNH {q_i} | {w_i}\n\n"
+
+            # 🔥 LOGIKA AI CERDAS MEMBACA ARAH PELANGGARAN TAF 🔥
+            rekomendasi_html, rekomendasi_tg = "", ""
+            if len(trend_cuaca) == 3:
+                jam_teks = [waktu[0][-5:], waktu[1][-5:], waktu[2][-5:]]
+                
+                # Cek Parameter Spesifik yang bermasalah dari Evaluasi Snapshot
+                is_wind = any("Angin" in r or "Wind" in r for r in l2_reasons)
+                is_vis_or_ceil = any("Visibilitas" in r or "Awan" in r or "Ceiling" in r for r in l2_reasons)
+                is_wx = any("Cuaca Signifikan" in r for r in l2_reasons)
+
+                # Deteksi Arah Pelanggaran: Apakah kondisi Membaik (Over-forecast) atau Memburuk (Under-forecast)?
+                is_improving = False
+                is_worsening = False
+                for r in l2_reasons:
+                    if "Visibilitas" in r:
+                        match = re.search(r'Aktual: (\d+)m, TAF: (\d+)m', r)
+                        if match and int(match.group(1)) > int(match.group(2)): is_improving = True
+                        else: is_worsening = True
+                    elif "Cuaca Signifikan" in r:
+                        if "Aktual 'Clear'" in r or "Aktual 'NSW'" in r: is_improving = True
+                        else: is_worsening = True
+                    elif "Ceiling" in r:
+                        match = re.search(r'Aktual: (\d+|None)ft, TAF: (\d+|None)ft', r)
+                        if match:
+                            a_val = 99999 if match.group(1) == 'None' else int(match.group(1))
+                            f_val = 99999 if match.group(2) == 'None' else int(match.group(2))
+                            if a_val > f_val: is_improving = True
+                            else: is_worsening = True
+                    elif "Kecepatan Angin" in r:
+                        match = re.search(r'Aktual (\d+)kt vs TAF (\d+)kt', r)
+                        if match and int(match.group(1)) < int(match.group(2)): is_improving = True
+                        else: is_worsening = True
+                    else:
+                        is_worsening = True
+
+                # Menentukan Teks Prediksi Model (Timeline)
+                if all(t == "GOOD" for t in trend_cuaca):
+                    teks_trend = "kondisi diprediksi stabil dan aman (cerah/berawan/nsw) ke depannya."
+                elif all(t == "BAD" for t in trend_cuaca):
+                    teks_trend = "kondisi perburukan parameter diprediksi persisten bertahan."
+                elif trend_cuaca[0] == "BAD" and "GOOD" in trend_cuaca:
+                    idx_reda = trend_cuaca.index("GOOD")
+                    teks_trend = f"kondisi diprediksi berangsur mereda/membaik pada pukul {jam_teks[idx_reda]} UTC."
+                elif trend_cuaca[0] == "GOOD" and "BAD" in trend_cuaca:
+                    idx_buruk = trend_cuaca.index("BAD")
+                    teks_trend = f"potensi perburukan lebih lanjut mulai pukul {jam_teks[idx_buruk]} UTC."
+                else:
+                    teks_trend = "kondisi parameter diprediksi akan berfluktuasi."
+
+                # Menyusun Skenario A & B Sesuai Kondisi
+                if status_color == 'green': 
+                    kesimpulan = f"METAR Aktual terpantau Normal. {teks_trend}"
+                    saran = "Tidak ada indikasi untuk Amandemen TAF saat ini. Lanjutkan pemantauan kondisi aktual."
+                elif status_color == '#D4AC0D': 
+                    kesimpulan = f"Terdapat fluktuasi cuaca via observasi (Laporan SPECI). {teks_trend}"
+                    saran = "Tingkatkan kewaspadaan observasi. Jadikan model NWP di atas sebagai acuan durasi jika Anda memutuskan untuk merilis AMD TAF."
+                else: 
+                    # Jika MERAH (Rekomendasi AMD TAF)
+                    if is_improving and not is_worsening:
+                        # KONDISI MEMBAIK (OVER-FORECAST / Cuaca Aktual lebih bagus dari TAF)
+                        kesimpulan = f"Kriteria AMD TAF terpenuhi karena kondisi aktual <b>LEBIH BAIK</b> dari prediksi TAF (<i>Over-forecast</i>). Konsensus NWP: {teks_trend}"
+                        skenario_a = "Jika cuaca sudah dipastikan membaik secara permanen, segera rilis AMD TAF untuk <b>MENGHAPUS</b> prediksi cuaca buruk tersebut agar operasional bandara kembali normal."
+                        skenario_b = "Jika radar/satelit menunjukkan sistem cuaca buruk masih berpotensi kembali masuk (<i>delayed</i>), ubah grup cuaca buruk tersebut menjadi sisipan <b>TEMPO</b> agar tidak menahan operasional secara penuh."
+                    else:
+                        # KONDISI MEMBURUK (UNDER-FORECAST / Cuaca Aktual lebih jelek dari TAF)
+                        kesimpulan = f"Kriteria AMD TAF terpenuhi secara aktual akibat perburukan! Konsensus NWP memprediksi 3 jam ke depan: {teks_trend}"
+                        
+                        if is_wind and not (is_vis_or_ceil or is_wx):
+                            skenario_a = "Jika pergeseran/gust angin ini murni akibat efek lokal sesaat (misal: dorongan awan <i>outflow</i>), gunakan sisipan <b>TEMPO</b> berdurasi singkat."
+                            skenario_b = "Jika pantauan satelit/analisis Anda menunjukkan pergeseran pola sinoptik yang lebih luas, amankan operasi dengan menyematkan <b>FM</b> atau sesuaikan <i>Base Group</i>."
+                        elif is_vis_or_ceil and not is_wx:
+                            skenario_a = "Jika penurunan jarak pandang/awan rendah ini berupa fenomena lokal tipis (misal: kabut radiasi cepat pudar), gunakan <b>TEMPO</b> atau <b>FM</b> singkat menuju kondisi normal."
+                            skenario_b = "Jika visibilitas/ceiling memburuk karena kelembapan persisten/stratus tebal yang meluas, pertahankan kondisi memburuk ini di <i>Base Group</i> atau gunakan <b>BECMG</b>."
+                        else:
+                            skenario_a = "Jika pantauan radar menunjukkan awan sel tunggal (CB) atau pergerakan hujan yang cepat, abaikan model dan cukup gunakan sisipan <b>TEMPO</b> singkat."
+                            skenario_b = "Jika radar juga menunjukkan sistem hujan/awan tebal yang memblokir area secara luas, ikuti <i>timeline</i> model. Gunakan <b>FM/BECMG</b> sesuai waktu peluruhan di atas."
+
+                    saran = f"Gunakan pantauan visual dan Citra Radar/Satelit terkini, lalu pilih skenario keputusan berikut:<br><ul style='padding-left:15px; margin-top:5px;'><li style='margin-bottom:5px;'><b>Skenario A (Lokal/Singkat/Aman):</b> {skenario_a}</li><li><b>Skenario B (Meluas/Persisten/Delay):</b> {skenario_b}</li></ul>"
+
+                rekomendasi_html = f"<div style='margin-top: 10px; background-color: #e9f7fd; border-left: 4px solid #17a2b8; color: #0c5460; padding: 10px; border-radius: 4px; white-space: normal;'>💡 <b>Pertimbangan Forecaster (AI Konsensus):</b><br>{kesimpulan}<br><br><b>🎯 Saran Keputusan:</b><br>{saran}</div>"
+                
+                # Format bersih untuk Telegram
+                s_tg = saran.replace('<br>','\n')
+                s_tg = re.sub(r"<ul[^>]*>", "", s_tg)
+                s_tg = s_tg.replace('</ul>', '')
+                s_tg = re.sub(r"<li[^>]*>", "- ", s_tg)
+                s_tg = s_tg.replace('</li>', '\n')
+                rekomendasi_tg = f"💡 <b>Pertimbangan Forecaster (AI Konsensus):</b>\n{kesimpulan}\n\n🎯 <b>Saran Keputusan:</b>\n{s_tg}"
+
+            return html_out + "<br>" + rekomendasi_html, (tg_out + rekomendasi_tg).strip()
+    except Exception: pass
+    return "Gagal menarik data NWP.", "Gagal menarik data NWP."
+
+# ==========================================
+# 4. PARSER & EVALUATOR TAF (MENGHINDARI SYMBOL ERROR UNTUK TELEGRAM)
+# ==========================================
 def extract_time_components(weather_str):
     if not weather_str or any(kw in weather_str for kw in ["NIL", "Error", "Gagal"]): return None
     match = re.search(r'\b(\d{2})(\d{2})(\d{2})Z\b', weather_str)
@@ -95,19 +286,18 @@ def extract_time_components(weather_str):
     return None
 
 def find_closest_data_by_grid_logic(target_dt, parsed_data_list):
-    target_hhmm = target_dt.strftime("%H%M")
-    for comp, text in parsed_data_list:
-        if comp['string_key'] == target_hhmm: return text
+    target_mins = target_dt.hour * 60 + target_dt.minute
     best_match = "NIL"
     min_diff = float('inf')
     for comp, text in parsed_data_list:
-        rel_data_mins = comp['hour'] * 60 + comp['minute']
-        rel_target_mins = target_dt.hour * 60 + target_dt.minute
-        diff = abs(rel_data_mins - rel_target_mins)
-        if diff > 720: diff = 1440 - diff
-        if diff <= 25:
-            if diff < min_diff:
-                min_diff = diff
+        data_mins = comp['hour'] * 60 + comp['minute']
+        diff = target_mins - data_mins
+        if diff < -720: diff += 1440
+        elif diff > 720: diff -= 1440
+        if -15 <= diff <= 120: 
+            abs_diff = abs(diff)
+            if abs_diff < min_diff:
+                min_diff = abs_diff
                 best_match = text
     return best_match
 
@@ -116,8 +306,7 @@ def parse_weather_string(weather_text):
     parsed = {'wind_dir': None, 'wind_spd': None, 'wind_spd_gust': None, 'vis': None, 'weather': [], 'vertical_vis': None, 'cloud_layers': []}
     wind_match = re.search(r'\b(\d{3}|VRB)(\d{2,3})(?:G(\d{2,3}))?(KT|MPS)\b', weather_text)
     if wind_match:
-        dir_str = wind_match.group(1)
-        parsed['wind_dir'] = int(dir_str) if dir_str != 'VRB' else None
+        parsed['wind_dir'] = int(wind_match.group(1)) if wind_match.group(1) != 'VRB' else None
         parsed['wind_spd'] = int(wind_match.group(2))
         if wind_match.group(3): parsed['wind_spd_gust'] = int(wind_match.group(3))
     if 'CAVOK' in weather_text:
@@ -126,15 +315,12 @@ def parse_weather_string(weather_text):
     else:
         vis_match = re.search(r'(?:\s|^)(\d{4})(?=\s|$)', weather_text)
         if vis_match: parsed['vis'] = int(vis_match.group(1))
-        wx_pattern = r'\b([-+]?(?:VC)?(?:MI|PR|BC|DR|BL|SH|TS|FZ)?(?:DZ|RA|SN|SG|IC|PE|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PO|SQ|FC|SS|DS))\b'
-        parsed['weather'] = re.findall(wx_pattern, weather_text)
+        parsed['weather'] = re.findall(r'\b([-+]?(?:VC)?(?:MI|PR|BC|DR|BL|SH|TS|FZ)?(?:DZ|RA|SN|SG|IC|PE|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PO|SQ|FC|SS|DS))\b', weather_text)
         if 'NSW' in weather_text: parsed['weather'] = []
         vv_match = re.search(r'\bVV(\d{3})\b', weather_text)
         if vv_match: parsed['vertical_vis'] = int(vv_match.group(1)) * 100
-        cloud_matches = re.findall(r'\b(FEW|SCT|BKN|OVC|NSC|SKC|CLR)(\d{3})?(?:CB|TCU)?\b', weather_text)
-        for amt, hgt in cloud_matches:
-            height_ft = int(hgt) * 100 if hgt else 0
-            parsed['cloud_layers'].append((amt, height_ft))
+        for amt, hgt in re.findall(r'\b(FEW|SCT|BKN|OVC|NSC|SKC|CLR)(\d{3})?(?:CB|TCU)?\b', weather_text):
+            parsed['cloud_layers'].append((amt, int(hgt) * 100 if hgt else 0))
     return parsed
 
 def get_active_taf_forecast(taf_str, eval_dt):
@@ -145,16 +331,12 @@ def get_active_taf_forecast(taf_str, eval_dt):
     active_forecast = parse_weather_string(parts[0])
     if not active_forecast: return None
     for part in parts[1:]:
-        part = part.strip()
         time_match = re.search(r'\b(\d{2})(\d{2})/(\d{2})(\d{2})\b', part)
         if time_match:
             start_rel = int(time_match.group(1)) * 24 + int(time_match.group(2))
             end_rel = int(time_match.group(3)) * 24 + int(time_match.group(4))
             if end_rel < start_rel: end_rel += 31 * 24
-            apply_trend = False
-            if part.startswith('TEMPO') and start_rel <= current_rel <= end_rel: apply_trend = True
-            elif part.startswith('BECMG') and current_rel >= start_rel: apply_trend = True 
-            if apply_trend:
+            if (part.startswith('TEMPO') and start_rel <= current_rel <= end_rel) or (part.startswith('BECMG') and current_rel >= start_rel):
                 trend_data = parse_weather_string(part)
                 if trend_data['wind_dir'] is not None: active_forecast['wind_dir'] = trend_data['wind_dir']
                 if trend_data['wind_spd'] is not None: active_forecast['wind_spd'] = trend_data['wind_spd']
@@ -166,68 +348,53 @@ def get_active_taf_forecast(taf_str, eval_dt):
                 elif trend_data['weather']: active_forecast['weather'] = trend_data['weather']
     return active_forecast
 
-def evaluate_snapshot(curr_metar_str, prev_metar_str, taf_str, eval_dt, has_speci):
-    l1_result = {'status': 'Tidak Diketahui', 'color': 'gray', 'reasons': ['Data tidak memadai.']}
+def evaluate_snapshot(curr_metar_str, taf_str, eval_dt, has_speci):
     l2_result = {'status': 'Tidak Diketahui', 'color': 'gray', 'reasons': ['Data tidak memadai.']}
-    if curr_metar_str == "NIL": return 'gray', l1_result, l2_result, None
+    if curr_metar_str == "NIL": return 'gray', l2_result, None
 
     actual = parse_weather_string(curr_metar_str)
-    actual_prev = parse_weather_string(prev_metar_str) if prev_metar_str != "NIL" else None
     forecast = get_active_taf_forecast(taf_str, eval_dt)
-    if not actual: return 'gray', l1_result, l2_result, None
+    if not actual: return 'gray', l2_result, None
 
-    l1_reasons = []
-    l1_level = 0
-    if actual_prev and actual['vis'] is not None and actual_prev['vis'] is not None:
-        if abs(actual['vis'] - actual_prev['vis']) >= 1500:
-            l1_reasons.append(f"Visibilitas bergeser tajam dari {actual_prev['vis']}m menjadi {actual['vis']}m.")
-            l1_level = 1
-    if l1_reasons or has_speci:
-        l1_level = 1
-        l1_result = {'status': 'Terdeteksi Perubahan', 'color': '#D4AC0D', 'reasons': l1_reasons or ["Perubahan parameter terekam pada laporan SPECI."]}
-    else:
-        l1_result = {'status': 'Stabil (Tidak Ada Lompatan)', 'color': 'green', 'reasons': ['Seluruh parameter stabil terhadap observasi sebelumnya.']}
+    l2_reasons, l2_level = [], 0 
+    if has_speci:
+        l2_reasons.append("Laporan SPECI baru diterbitkan (Indikasi fluktuasi cuaca).")
+        l2_level = 1
 
-    l2_reasons = []
-    l2_level = 0 
     if forecast:
+        # Menggunakan ≥ (simbol unicode) untuk menghindari error tag HTML saat dikirim ke Telegram
         if isinstance(actual['wind_dir'], int) and isinstance(forecast['wind_dir'], int):
             dir_diff = abs(actual['wind_dir'] - forecast['wind_dir'])
-            if dir_diff > 180: dir_diff = 360 - dir_diff
+            dir_diff = 360 - dir_diff if dir_diff > 180 else dir_diff
             if dir_diff >= 60 and ((actual['wind_spd'] or 0) >= 10 or (forecast['wind_spd'] or 0) >= 10):
-                l2_reasons.append(f"Wind Shift: Aktual {actual['wind_dir']}° vs TAF {forecast['wind_dir']}° (Selisih >= 60° dengan kecepatan angin >= 10kt).")
+                l2_reasons.append(f"Pergeseran Arah Angin: Aktual {actual['wind_dir']}° vs TAF {forecast['wind_dir']}° (Selisih ≥ 60° dengan kecepatan angin ≥ 10kt).")
                 l2_level = 2
-        if actual['wind_spd'] is not None and forecast['wind_spd'] is not None:
-            if abs(actual['wind_spd'] - forecast['wind_spd']) >= 10:
-                l2_reasons.append(f"Wind Speed Dev: Aktual {actual['wind_spd']}kt vs TAF {forecast['wind_spd']}kt (Selisih >= 10kt).")
-                l2_level = 2
-        act_gst = actual.get('wind_spd_gust') if actual.get('wind_spd_gust') is not None else actual['wind_spd']
-        fct_gst = forecast.get('wind_spd_gust') if forecast.get('wind_spd_gust') is not None else forecast['wind_spd']
-        if act_gst is not None and fct_gst is not None:
-            if abs(act_gst - fct_gst) >= 10 and ((actual['wind_spd'] or 0) >= 15 or (forecast['wind_spd'] or 0) >= 15):
-                l2_reasons.append(f"Wind Gust Dev: Selisih hembusan (Gust) mencapai {abs(act_gst - fct_gst)}kt dengan kecepatan dasar >= 15kt.")
-                l2_level = 2
+        if actual['wind_spd'] is not None and forecast['wind_spd'] is not None and abs(actual['wind_spd'] - forecast['wind_spd']) >= 10:
+            l2_reasons.append(f"Kecepatan Angin: Aktual {actual['wind_spd']}kt vs TAF {forecast['wind_spd']}kt (Selisih ≥ 10kt).")
+            l2_level = 2
+        act_gst = actual.get('wind_spd_gust') or actual['wind_spd']
+        fct_gst = forecast.get('wind_spd_gust') or forecast['wind_spd']
+        if act_gst is not None and fct_gst is not None and abs(act_gst - fct_gst) >= 10 and ((actual['wind_spd'] or 0) >= 15 or (forecast['wind_spd'] or 0) >= 15):
+            l2_reasons.append(f"Wind Gust Dev: Selisih hembusan (Gust) mencapai {abs(act_gst - fct_gst)}kt dengan kecepatan dasar ≥ 15kt.")
+            l2_level = 2
         if (actual['wind_spd'] or 0) >= 20:
             l2_reasons.append(f"Wind Operational Threshold: Kecepatan angin aktual ({actual['wind_spd']}kt) melampaui batas aman komparasi.")
             l2_level = max(l2_level, 1)
-        vis_thresholds = [150, 350, 600, 800, 1500, 3000, 5000]
         if actual['vis'] is not None and forecast['vis'] is not None:
-            for th in vis_thresholds:
+            for th in [150, 350, 600, 800, 1500, 3000, 5000]:
                 if (actual['vis'] < th <= forecast['vis']) or (forecast['vis'] < th <= actual['vis']):
                     l2_reasons.append(f"Visibilitas melewati threshold {th}m (Aktual: {actual['vis']}m, TAF: {forecast['vis']}m).")
                     l2_level = 2
                     break
-        critical_wx_patterns = [r'TS', r'SQ', r'FC', r'FZ', r'DS', r'SS', r'BL', r'DR', r'SH', r'RA', r'DZ', r'FG']
-        actual_crit = [wx for W in actual['weather'] for wx in critical_wx_patterns if re.search(wx, W)]
-        forecast_crit = [wx for W in forecast['weather'] for wx in critical_wx_patterns if re.search(wx, W)]
+        actual_crit = [wx for W in actual['weather'] for wx in [r'TS', r'SQ', r'FC', r'FZ', r'DS', r'SS', r'BL', r'DR', r'SH', r'RA', r'DZ', r'FG'] if re.search(wx, W)]
+        forecast_crit = [wx for W in forecast['weather'] for wx in [r'TS', r'SQ', r'FC', r'FZ', r'DS', r'SS', r'BL', r'DR', r'SH', r'RA', r'DZ', r'FG'] if re.search(wx, W)]
         if set(actual_crit) != set(forecast_crit):
             l2_reasons.append(f"Cuaca Signifikan: Aktual '{', '.join(actual_crit) or 'Clear'}' vs TAF '{', '.join(forecast_crit) or 'Clear'}'.")
             l2_level = 2
-        cloud_thresholds = [100, 200, 500, 1000, 1500]
         act_ceil = min([h for a, h in actual['cloud_layers'] if a in ['BKN', 'OVC']], default=None)
         fct_ceil = min([h for a, h in forecast['cloud_layers'] if a in ['BKN', 'OVC']], default=None)
         if act_ceil is not None and fct_ceil is not None:
-            for th in cloud_thresholds:
+            for th in [100, 200, 500, 1000, 1500]:
                 if (act_ceil < th <= fct_ceil) or (fct_ceil < th <= act_ceil):
                     l2_reasons.append(f"Ceiling awan melewati {th}ft (Aktual: {act_ceil}ft, TAF: {fct_ceil}ft).")
                     l2_level = 2
@@ -237,153 +404,343 @@ def evaluate_snapshot(curr_metar_str, prev_metar_str, taf_str, eval_dt, has_spec
         if act_low_cloud != fct_low_cloud:
             l2_reasons.append(f"Kategori Awan: Perubahan formasi awan tertutup (BKN/OVC) di bawah 1500ft.")
             l2_level = 2
-        if actual['vertical_vis'] is not None and forecast['vertical_vis'] is not None:
-            for th in [100, 200, 500, 1000]:
-                if (actual['vertical_vis'] < th <= forecast['vertical_vis']) or (forecast['vertical_vis'] < th <= actual['vertical_vis']):
-                    l2_reasons.append(f"Vertical Visibility: Nilai aktual {actual['vertical_vis']}ft melewati batas {th}ft.")
-                    l2_level = 2
-                    break
-    if l2_level == 2: l2_result = {'status': 'AMD TAF Recommended', 'color': 'red', 'reasons': l2_reasons}
-    elif l2_level == 1: l2_result = {'status': 'Potential TAF Mismatch', 'color': 'orange', 'reasons': l2_reasons}
-    else: l2_result = {'status': 'Normal', 'color': 'green', 'reasons': ['Parameter aktual selaras dengan prakiraan dasar TAF.']}
-    overall_color = 'red' if l2_level == 2 else ('orange' if l2_level == 1 else ('#D4AC0D' if l1_result['color'] == '#D4AC0D' else 'green'))
-    return overall_color, l1_result, l2_result, actual['wind_dir']
 
+    if l2_level == 2: 
+        l2_result = {'status': 'REKOMENDASI AMD TAF', 'color': 'red', 'reasons': l2_reasons}
+        overall_color = 'red'
+    elif l2_level == 1: 
+        l2_result = {'status': 'POTENSI AMANDEMEN TAF', 'color': '#D4AC0D', 'reasons': l2_reasons}
+        overall_color = '#D4AC0D'
+    else: 
+        l2_result = {'status': 'Normal', 'color': 'green', 'reasons': ['Parameter aktual selaras dengan prakiraan dasar TAF.']}
+        overall_color = 'green'
+
+    return overall_color, l2_result, actual['wind_dir']
+
+# ==========================================
+# 5. FUNGSI WORKER PARALEL
+# ==========================================
+def process_airport(row, grid_times):
+    icao = row['ICAO']
+    
+    local_session = requests.Session()
+    local_session.headers.update({
+        'accept': '*/*', 
+        'Authorization': f'Bearer {API_TOKEN}',
+        'Connection': 'keep-alive',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    })
+    
+    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    local_session.mount("https://", adapter)
+    
+    def fetch(dtype, count):
+        url = f"https://web-aviation.bmkg.go.id/api/v1/{dtype}/{icao.lower()}"
+        try:
+            res = local_session.get(url, timeout=15)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) == 0: return []
+                if isinstance(data, dict) and icao.upper() in data:
+                    w_list = data[icao.upper()]
+                    if isinstance(w_list, list):
+                        return [w.get('data_text', "") for w in w_list[:count] if 'data_text' in w]
+        except: pass
+        return []
+
+    time.sleep(random.uniform(0.5, 1.5))
+
+    metars = fetch('metar', 45)
+    if not metars:
+        time.sleep(2) 
+        metars = fetch('metar', 45)
+        
+    specis = fetch('speci', 20)
+    tafs = fetch('taf', 1)
+    taf_str = tafs[0] if len(tafs) > 0 else "NIL"
+    
+    if metars:
+        print(f"✅ {icao} Berhasil")
+    else:
+        print(f"❌ {icao} Kosong (Akan tampil abu-abu)")
+
+    parsed_metars = [ (extract_time_components(m), m) for m in metars if extract_time_components(m) ]
+    parsed_specis = [ (extract_time_components(s), s) for s in specis if extract_time_components(s) ]
+
+    station_features = []
+    station_alerts = []
+
+    final_color = 'green'
+    final_reasons = []
+    for grid_time in grid_times:
+        curr_metar = find_closest_data_by_grid_logic(grid_time, parsed_metars)
+        has_speci = any(0 <= (grid_time.hour * 60 + grid_time.minute) - (comp['hour'] * 60 + comp['minute']) <= 30 for comp, _ in parsed_specis if comp)
+        c, l2_res, _ = evaluate_snapshot(curr_metar, taf_str, grid_time, has_speci)
+        if grid_time == grid_times[-1]: 
+            final_color = c
+            final_reasons = l2_res['reasons']
+
+    nwp_html, nwp_tg = get_nwp_forecast(row['Lintang'], row['Bujur'], final_color, final_reasons)
+
+    nwp_section = ""
+    if nwp_html:
+        nwp_section = f"""
+        <details style="margin-top: 15px; margin-bottom: 10px; background: #ffffff; border: 1px solid #17a2b8; border-radius: 5px;">
+            <summary style="padding: 8px 10px; font-size: 11px; font-weight: bold; color: #0c5460; background-color: #d1ecf1; cursor: pointer; outline: none; border-radius: 4px;">
+                📊 PERTIMBANGAN MODEL NWP (Klik untuk buka)
+            </summary>
+            <div style="padding: 10px; font-size: 10px; line-height: 1.5; white-space: nowrap; overflow-x: auto;">
+                {nwp_html}
+            </div>
+        </details>
+        """
+
+    for grid_time in grid_times:
+        curr_metar = find_closest_data_by_grid_logic(grid_time, parsed_metars)
+        
+        target_mins = grid_time.hour * 60 + grid_time.minute
+        speci_alert_str = "NIL (Tidak ada SPECI relevan)"
+        has_speci = False
+        for comp, s_str in parsed_specis:
+            data_mins = comp['hour'] * 60 + comp['minute']
+            diff = target_mins - data_mins
+            if diff < -720: diff += 1440
+            elif diff > 720: diff -= 1440
+            if 0 <= diff <= 30:
+                has_speci, speci_alert_str = True, s_str
+                break
+        
+        color, l2_res, wind_dir_int = evaluate_snapshot(curr_metar, taf_str, grid_time, has_speci)
+        
+        if grid_time == grid_times[-1] and color == 'red':
+            alasan = "\n- ".join(l2_res['reasons'])
+            waktu_generate = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
+            
+            # Format pesan aman untuk Telegram HTML parse mode
+            pesan_alert = (
+                f"🚨 <b>{icao} ({row['Nama_Bandara']})</b>\n"
+                f"⏱ <b>Waktu Generate:</b> {waktu_generate}\n"
+                f"<b>Status:</b> REKOMENDASI AMD TAF\n"
+                f"<b>Penyebab:</b>\n- {alasan}\n\n"
+                f"<b>[ METAR AKTUAL ]</b>\n<code>{curr_metar}</code>\n\n"
+                f"<b>[ TAF TERBARU ]</b>\n<code>{taf_str}</code>\n\n"
+                f"<b>[ 🤖 ASISTEN TAF ]</b>\n{nwp_tg}"
+            )
+            station_alerts.append(pesan_alert)
+
+        l2_html = "".join([f"<li>{r}</li>" for r in l2_res['reasons']])
+        curr_comp = extract_time_components(curr_metar)
+        jam_label = f"{curr_comp['hour']:02d}:{curr_comp['minute']:02d} UTC" if curr_comp else grid_time.strftime("%H:%M UTC")
+        
+        # Tambahkan ID ICAO di tag h4 agar dikenali oleh JS Keep-Open Popup
+        popup_html = f"""
+        <div style="max-width: 380px; min-width: 250px; width: max-content; font-family: Arial, sans-serif; white-space: normal;">
+            <div style="background-color: {color if color != '#D4AC0D' else '#D4AC0D'}; color: {'black' if color == '#D4AC0D' else 'white'}; padding: 10px; border-radius: 5px 5px 0 0; text-align: center;">
+                <h4 style="margin: 0; font-weight: bold;">{icao} <span style="font-size:12px; font-weight:normal;">({jam_label})</span></h4>
+                <p style="margin: 5px 0 0 0; font-size: 12px;">{row['Nama_Bandara']}</p>
+            </div>
+            <div style="padding: 15px; background-color: #f8f9fa; border: 1px solid #ddd; border-top: none;">
+                
+                <div style="margin-bottom: 10px; border-left: 4px solid {l2_res['color']}; padding-left: 10px;">
+                    <span style="font-size: 11px; font-weight: bold; color: #555;">EVALUASI TAF AKTUAL</span><br>
+                    <span style="font-size: 14px; font-weight: bold; color: {l2_res['color']};">{l2_res['status']}</span>
+                    <ul style="margin: 5px 0 0 0; padding-left: 15px; font-size: 11px; color: #333;">{l2_html}</ul>
+                </div>
+                
+                <hr style="border: 0; border-top: 1px solid #ccc; margin: 10px 0;">
+                
+                <div style="max-height: 160px; overflow-y: auto; font-size: 11px;">
+                    <p style="margin: 0 0 5px 0; color: #004085; font-weight:bold;">[ METAR AKTUAL ]</p>
+                    <div style="background: #e9ecef; padding: 6px; border-radius: 4px; font-family: monospace; margin-bottom: 10px; overflow-x: auto;">{curr_metar}</div>
+                    <p style="margin: 0 0 5px 0; color: #856404; font-weight:bold;">[ LAPORAN SPECI ]</p>
+                    <div style="background: #fff3cd; padding: 6px; border-radius: 4px; font-family: monospace; margin-bottom: 10px; overflow-x: auto;">{speci_alert_str}</div>
+                    <p style="margin: 0 0 5px 0; color: #155724; font-weight:bold;">[ PRAKIRAAN TAF TERBARU ]</p>
+                    <div style="background: #d4edda; padding: 6px; border-radius: 4px; font-family: monospace; margin-bottom: 10px; overflow-x: auto;">{taf_str}</div>
+                </div>
+
+                {nwp_section}
+
+            </div>
+        </div>
+        """
+        
+        station_features.append({'type': 'Feature', 'geometry': {'type': 'Point', 'coordinates': [row['Bujur'], row['Lintang']]},
+            'properties': {'time': grid_time.isoformat(), 'popup': popup_html, 'icon': 'circle',
+            'iconstyle': {'fillColor': color if color != '#D4AC0D' else '#F1C40F', 'fillOpacity': 0.85, 'stroke': 'true', 'color': 'white', 'weight': 1.5, 'radius': 9}}})
+            
+    return station_features, station_alerts
+
+# ==========================================
+# 6. GENERATE MAP
+# ==========================================
 def create_dynamic_webgis(df):
     m = folium.Map(location=[-2.5, 118.0], zoom_start=5, tiles='cartodbdark_matter')
-
     folium.TileLayer('openstreetmap', name='Standard Maps (Minimal)').add_to(m)
-    folium.TileLayer(
-        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        attr='Esri, Maxar, Earthstar Geographics',
-        name='Satellite Imagery (Satelit Esri)'
-    ).add_to(m)
+    folium.TileLayer(tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr='Esri', name='Satellite Imagery').add_to(m)
     folium.LayerControl().add_to(m)
     
     update_time_str = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
-    
     m.get_root().html.add_child(folium.Element(f'''
-    <div align="center" style="position: absolute; z-index: 9999; top: 15px; left: 50%; transform: translateX(-50%);
-    background-color: rgba(44, 62, 80, 0.95); padding: 10px 25px; border-radius: 8px; 
-    box-shadow: 0px 4px 6px rgba(0,0,0,0.5); border: 1px solid #34495E; font-family: Arial; text-align: center;">
+    <div align="center" style="position: absolute; z-index: 9999; top: 15px; left: 50%; transform: translateX(-50%); background-color: rgba(44, 62, 80, 0.95); padding: 10px 25px; border-radius: 8px; box-shadow: 0px 4px 6px rgba(0,0,0,0.5); border: 1px solid #34495E; font-family: Arial; text-align: center;">
         <h3 style="font-size:22px; font-weight:bold; color: #ECF0F1; margin: 0; padding: 0;">WiraAvia</h3>
-        <p style="font-size:12px; font-style: italic; color: #BDC3C7; margin: 4px 0 0 0; padding: 0;">
-            (Web-gis Interface for Rapid Assessment of Aviation Weather)
-        </p>
+        <p style="font-size:12px; font-style: italic; color: #BDC3C7; margin: 4px 0 0 0; padding: 0;">(Web-gis Interface for Rapid Assessment of Aviation Weather)</p>
         <p style="font-size:10px; color: #F1C40F; margin: 5px 0 0 0; padding: 0;">Last Server Fetch: {update_time_str}</p>
     </div>
     '''))
     
     m.get_root().html.add_child(folium.Element('''
-    <div style="position: fixed; bottom: 80px; left: 30px; width: 270px; 
-    background-color: rgba(44, 62, 80, 0.95); color: #ECF0F1; z-index:9999; font-size:13px; font-family: Arial;
-    border: 1px solid #34495E; border-radius: 8px; padding: 15px; box-shadow: 0px 4px 6px rgba(0,0,0,0.5);">
+    <div style="position: fixed; bottom: 80px; left: 30px; width: 280px; background-color: rgba(44, 62, 80, 0.95); color: #ECF0F1; z-index:9999; font-size:13px; font-family: Arial; border: 1px solid #34495E; border-radius: 8px; padding: 15px; box-shadow: 0px 4px 6px rgba(0,0,0,0.5);">
     <h4 style="margin-top:0; font-weight:bold; font-size:14px; text-align:center;">🚦 Hierarki Peringatan Dini</h4><hr style="margin:5px 0; border-top: 1px solid #7F8C8D;">
     <span style="color:green; font-size:16px;">●</span> <b>Hijau:</b> Normal<br>
-    <span style="color:#F1C40F; font-size:16px;">●</span> <b style="color:#F1C40F;">Kuning:</b> Rapid Weather Change<br>
-    <span style="color:orange; font-size:16px;">●</span> <b style="color:orange;">Orange:</b> Potential TAF Mismatch<br>
-    <span style="color:red; font-size:16px;">●</span> <b style="color:red;">Merah:</b> AMD TAF Recommended<br>
+    <span style="color:#F1C40F; font-size:16px;">●</span> <b style="color:#F1C40F;">Kuning:</b> SPECI & Potensi AMD TAF<br>
+    <span style="color:red; font-size:16px;">●</span> <b style="color:red;">Merah:</b> Rekomendasi AMD TAF<br>
     </div>
     '''))
 
-    features = []
+    # 🔥 INJEKSI JAVASCRIPT AGAR POPUP TIDAK TERTUTUP SAAT WAKTU BERGESER 🔥
+    js_keep_popup_open = """
+    <script>
+    document.addEventListener("DOMContentLoaded", function() {
+        setTimeout(function() {
+            var mapObj = null;
+            for (var key in window) {
+                if (window[key] && window[key] instanceof L.Map) {
+                    mapObj = window[key];
+                    break;
+                }
+            }
+            if (mapObj && mapObj.timeDimension) {
+                var currentOpenIcao = null;
+                
+                mapObj.on('popupopen', function(e) {
+                    var content = e.popup.getContent();
+                    var match = content.match(/<h4[^>]*>([A-Z]{4})\s*</);
+                    if (match) {
+                        currentOpenIcao = match[1];
+                    }
+                });
+                
+                mapObj.on('popupclose', function(e) {
+                    setTimeout(function(){
+                        if(!mapObj._popup) currentOpenIcao = null;
+                    }, 50);
+                });
+                
+                mapObj.timeDimension.on('timeload', function() {
+                    if (currentOpenIcao) {
+                        setTimeout(function(){
+                            mapObj.eachLayer(function(layer) {
+                                if (layer.getPopup && layer.getPopup()) {
+                                    var content = layer.getPopup().getContent();
+                                    if (content && content.includes(">" + currentOpenIcao + " <")) {
+                                        layer.openPopup();
+                                    }
+                                }
+                            });
+                        }, 100);
+                    }
+                });
+            }
+        }, 1000);
+    });
+    </script>
+    """
+    m.get_root().html.add_child(folium.Element(js_keep_popup_open))
+
+    all_features = []
+    all_telegram_alerts = []
+    
     now = datetime.now(timezone.utc)
     minute_grid = 30 if now.minute >= 30 else 0
     latest_grid = now.replace(minute=minute_grid, second=0, microsecond=0)
-    grid_times = [latest_grid - timedelta(minutes=30 * i) for i in range(3)]
+    
+    grid_times = [latest_grid - timedelta(minutes=30 * i) for i in range(2)]
     grid_times.reverse() 
 
-    for index, row in df.iterrows():
-        icao = row['ICAO']
-        metars = get_weather_data(icao, 'metar', count=45)
-        specis = get_weather_data(icao, 'speci', count=20)
-        tafs = get_weather_data(icao, 'taf', count=1)
-        taf_str = tafs[0] if len(tafs) > 0 else "NIL"
-        
-        if len(metars) == 0: continue
+    print(f"🚀 Memproses {len(df)} Bandara (Throttled Multithreading: 3 Jalur Aman)...")
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(process_airport, row, grid_times): row['ICAO'] for _, row in df.iterrows()}
+        for future in as_completed(futures):
+            try:
+                f_list, a_list = future.result()
+                all_features.extend(f_list)
+                all_telegram_alerts.extend(a_list)
+            except Exception as e:
+                pass
             
-        parsed_metars = []
-        for metar_text_raw in metars:
-            dt_comp = extract_time_components(metar_text_raw)
-            if dt_comp: parsed_metars.append((dt_comp, metar_text_raw))
-            
-        parsed_specis = []
-        for speci_text_raw in specis:
-            dt_comp = extract_time_components(speci_text_raw)
-            if dt_comp: parsed_specis.append((dt_comp, speci_text_raw))
-            
-        for grid_time in grid_times:
-            curr_metar = find_closest_data_by_grid_logic(grid_time, parsed_metars)
-            prev_metar = find_closest_data_by_grid_logic(grid_time - timedelta(minutes=30), parsed_metars)
-            target_hhmm = grid_time.strftime("%H%M")
-            has_speci = False
-            speci_alert_str = "NIL (Tidak ada laporan SPECI baru pada jam ini)"
-            for comp, s_str in parsed_specis:
-                if comp['string_key'] == target_hhmm:
-                    has_speci = True
-                    speci_alert_str = s_str
-                    break
-            
-            color, l1_res, l2_res, wind_dir_int = evaluate_snapshot(curr_metar, prev_metar, taf_str, grid_time, has_speci)
-            l1_html = "".join([f"<li>{r}</li>" for r in l1_res['reasons']])
-            l2_html = "".join([f"<li>{r}</li>" for r in l2_res['reasons']])
-            waktu_lokal_str = grid_time.strftime("%d %b %Y, %H:%M UTC")
+    plugins.TimestampedGeoJson({'type': 'FeatureCollection', 'features': all_features}, period='PT30M', add_last_point=True, auto_play=False, loop=False, max_speed=1, time_slider_drag_update=True, duration='PT30M').add_to(m)
+    return m, all_telegram_alerts
 
-            popup_html = f"""
-            <div style="width: 450px; font-family: Arial, sans-serif;">
-                <div style="background-color: {color if color != '#D4AC0D' else '#D4AC0D'}; color: {'black' if color == '#D4AC0D' else 'white'}; padding: 10px; border-radius: 5px 5px 0 0; text-align: center;">
-                    <h4 style="margin: 0; font-weight: bold;">{icao} <span style="font-size:12px; font-weight:normal;">({waktu_lokal_str})</span></h4>
-                    <p style="margin: 5px 0 0 0; font-size: 12px;">{row['Nama_Bandara']}</p>
-                </div>
-                <div style="padding: 15px; background-color: #f8f9fa; border: 1px solid #ddd; border-top: none;">
-                    <div style="margin-bottom: 12px; border-left: 4px solid {l1_res['color']}; padding-left: 10px;">
-                        <span style="font-size: 11px; font-weight: bold; color: #555;">OBSERVASI (METAR)</span><br>
-                        <span style="font-size: 14px; font-weight: bold; color: {l1_res['color'] if l1_res['color'] != '#D4AC0D' else '#9A7D0A'};">{l1_res['status']}</span>
-                        <ul style="margin: 5px 0 0 0; padding-left: 15px; font-size: 11px; color: #333;">{l1_html}</ul>
-                    </div>
-                    <div style="margin-bottom: 15px; border-left: 4px solid {l2_res['color']}; padding-left: 10px;">
-                        <span style="font-size: 11px; font-weight: bold; color: #555;">EVALUASI TAF</span><br>
-                        <span style="font-size: 14px; font-weight: bold; color: {l2_res['color']};">{l2_res['status']}</span>
-                        <ul style="margin: 5px 0 0 0; padding-left: 15px; font-size: 11px; color: #333;">{l2_html}</ul>
-                    </div>
-                    <hr style="border: 0; border-top: 1px solid #ccc; margin: 10px 0;">
-                    <div style="max-height: 160px; overflow-y: auto; font-size: 11px;">
-                        <p style="margin: 0 0 5px 0; color: #004085; font-weight:bold;">[ DATA METAR AKTUAL ]</p>
-                        <div style="background: #e9ecef; padding: 6px; border-radius: 4px; font-family: monospace; margin-bottom: 10px;">{curr_metar}</div>
-                        <p style="margin: 0 0 5px 0; color: #856404; font-weight:bold;">[ LAPORAN SPECI ]</p>
-                        <div style="background: #fff3cd; padding: 6px; border-radius: 4px; font-family: monospace; margin-bottom: 10px;">{speci_alert_str}</div>
-                        <p style="margin: 0 0 5px 0; color: #155724; font-weight:bold;">[ PRAKIRAAN TAF TERBARU ]</p>
-                        <div style="background: #d4edda; padding: 6px; border-radius: 4px; font-family: monospace;">{taf_str}</div>
-                    </div>
-                </div>
-            </div>
-            """
-            
-            feature = {
-                'type': 'Feature',
-                'geometry': {'type': 'Point', 'coordinates': [row['Bujur'], row['Lintang']]},
-                'properties': {
-                    'time': grid_time.isoformat(),
-                    'popup': popup_html,
-                    'icon': 'circle',
-                    'iconstyle': {
-                        'fillColor': color if color != '#D4AC0D' else '#F1C40F',
-                        'fillOpacity': 0.85, 'stroke': 'true', 'color': 'white', 'weight': 1.5, 'radius': 9
-                    }
-                }
-            }
-            features.append(feature)
-
-    plugins.TimestampedGeoJson(
-        {'type': 'FeatureCollection', 'features': features},
-        period='PT30M', add_last_point=True, auto_play=False, loop=False,
-        max_speed=1, time_slider_drag_update=True, duration='PT30M' 
-    ).add_to(m)
+# ==========================================
+# 7. UPLOAD GITHUB & TELEGRAM
+# ==========================================
+def push_to_github(html_string, token, repo, path="index.html"):
+    print("\n[Upload] Mengirim Peta WiraAvia ke GitHub...")
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
     
-    return m
+    encoded_content = base64.b64encode(html_string.encode('utf-8')).decode('utf-8')
+    response = requests.get(url, headers=headers)
+    sha = response.json().get('sha') if response.status_code == 200 else None
 
+    data = {"message": f"Auto-update Peta WiraAvia {datetime.now().strftime('%H:%M:%S')}", "content": encoded_content, "branch": "main"}
+    if sha: data["sha"] = sha 
+
+    put_response = requests.put(url, headers=headers, json=data)
+    if put_response.status_code in [200, 201]:
+        print("✅ Peta berhasil diterbangkan ke Internet!")
+        print(f"🌍 Link Web Anda: https://{repo.split('/')[0]}.github.io/{repo.split('/')[1]}/")
+    else:
+        print(f"❌ GAGAL UPLOAD: Kode {put_response.status_code}")
+
+def send_telegram_alert(token, chat_id, alerts_list, repo):
+    if not alerts_list:
+        print("✅ Peta aman, tidak ada status MERAH. (Telegram standby).")
+        return
+    
+    print(f"⚠️ Mengirim {len(alerts_list)} peringatan MERAH ke Telegram...")
+    
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    
+    # 1. Kirim Pesan Intro/Header Dulu
+    intro = f"⚠️ <b>WIRAAVIA ALERT: {len(alerts_list)} STASIUN BUTUH AMD TAF!</b> ⚠️\n🌍 <b>Cek Peta Penuh:</b> https://{repo.split('/')[0]}.github.io/{repo.split('/')[1]}/"
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": intro, "parse_mode": "HTML"})
+    except: pass
+    
+    # 2. Kirim masing-masing alert satu per satu untuk menghindari Limit Telegram 4096 Karakter
+    for alert in alerts_list:
+        payload = {"chat_id": chat_id, "text": alert, "parse_mode": "HTML"}
+        try:
+            res = requests.post(url, json=payload)
+            if res.status_code != 200:
+                print(f"❌ Gagal kirim Telegram untuk 1 stasiun: {res.text}")
+        except Exception:
+            pass
+        time.sleep(0.5) # Anti-Spam API Telegram
+        
+    print("📲 Semua Notifikasi Telegram berhasil diproses!")
+
+# ==========================================
+# 8. RUN SCRIPT
+# ==========================================
 if __name__ == "__main__":
-    print("Memulai proses penarikan data BMKG (Bypass Mode)...")
-    dashboard_map = create_dynamic_webgis(df_bandara)
-    dashboard_map.save("index.html")
-    print("Selesai! File 'index.html' berhasil diperbarui.")
+    print("==================================================")
+    print("MENGHIDUPKAN WIRAAVIA (Sistem Final Anti-Error)")
+    print("==================================================")
+    mulai = time.time()
+    
+    dashboard_map, alert_messages = create_dynamic_webgis(df_bandara)
+    
+    html_filename = "Dashboard_RealTime_Final.html"
+    dashboard_map.save(html_filename)
+    webbrowser.open('file://' + os.path.abspath(html_filename))
+    
+    html_string = dashboard_map.get_root().render()
+    push_to_github(html_string, GITHUB_TOKEN, GITHUB_REPO)
+    send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, alert_messages, GITHUB_REPO)
+    
+    durasi = time.time() - mulai
+    print("==================================================")
+    print(f"🏁 EKSEKUSI SELESAI DALAM WAKTU {durasi:.1f} DETIK!")
