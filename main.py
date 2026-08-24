@@ -10,12 +10,13 @@ import webbrowser
 import time
 import re
 import base64
+import random # 🔥 DITAMBAHKAN: Modul krusial yang sebelumnya hilang
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================
 # KONFIGURASI GITHUB UPLOADER & TELEGRAM
 # ==========================================
-# Menggunakan os.getenv agar rahasia aman di GitHub Actions
 GITHUB_TOKEN = os.getenv('MY_GITHUB_TOKEN')
 GITHUB_REPO = 'Azan-Lab1772/wiraavia'
 
@@ -57,14 +58,15 @@ data_csv = """No,ICAO,Nama_Bandara,Lintang,Bujur,WMO
 df_bandara = pd.read_csv(io.StringIO(data_csv))
 
 # ==========================================
-# 2. FUNGSI TARIK DATA BMKG
+# 2. FUNGSI TARIK DATA BMKG (ANTI-WAF BLOCK)
 # ==========================================
 API_TOKEN = '37da31a5cc6f0732732a7f9c640507b2849e37a3b815b0252af2a54afc7a'
 HEADERS = {
     'accept': '*/*', 
     'Authorization': f'Bearer {API_TOKEN}',
     'Connection': 'close',
-    'User-Agent': 'Mozilla/5.0'
+    # 🔥 DITAMBAHKAN: User-Agent persis seperti Streamlit agar tembus Firewall BMKG
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
 }
 
 session = requests.Session()
@@ -412,17 +414,18 @@ def evaluate_snapshot(curr_metar_str, taf_str, eval_dt, has_speci):
     return overall_color, l2_result, actual['wind_dir']
 
 # ==========================================
-# 5. PEMROSESAN STASIUN TUNGGAL
+# 5. FUNGSI WORKER PARALEL
 # ==========================================
 def process_airport(row, grid_times):
     icao = row['ICAO']
     
     local_session = requests.Session()
+    # 🔥 DITAMBAHKAN: User-Agent persis seperti Streamlit untuk Worker Thread juga
     local_session.headers.update({
         'accept': '*/*', 
         'Authorization': f'Bearer {API_TOKEN}',
         'Connection': 'keep-alive',
-        'User-Agent': 'Mozilla/5.0'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
     })
     
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
@@ -563,7 +566,7 @@ def process_airport(row, grid_times):
     return station_features, station_alerts
 
 # ==========================================
-# 6. PEMBUATAN PETA (LOOPING BULDOSER / SEKUENSIAL)
+# 6. GENERATE MAP (MULTITHREADING RINGAN)
 # ==========================================
 def create_dynamic_webgis(df):
     m = folium.Map(location=[-2.5, 118.0], zoom_start=5, tiles='cartodbdark_matter')
@@ -599,15 +602,17 @@ def create_dynamic_webgis(df):
     grid_times = [latest_grid - timedelta(minutes=30 * i) for i in range(2)]
     grid_times.reverse() 
 
-    # MENGGUNAKAN LOOPING "BULDOSER" ASLI ANDA UNTUK KEAMANAN GH ACTIONS
-    print(f"🚀 Memproses {len(df)} Bandara (Looping Sekuensial Anti-Blokir)...")
-    for index, row in df.iterrows():
-        try:
-            f_list, a_list = process_airport(row, grid_times)
-            all_features.extend(f_list)
-            all_telegram_alerts.extend(a_list)
-        except Exception as e:
-            print(f"❌ Terjadi Error pada {row['ICAO']}: {e}")
+    print(f"🚀 Memproses {len(df)} Bandara (Throttled Multithreading: 3 Jalur Aman)...")
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(process_airport, row, grid_times): row['ICAO'] for _, row in df.iterrows()}
+        for future in as_completed(futures):
+            try:
+                f_list, a_list = future.result()
+                all_features.extend(f_list)
+                all_telegram_alerts.extend(a_list)
+            except Exception as e:
+                # 🔥 DITAMBAHKAN: Laporan error jika terjadi kegagalan agar tidak mati diam-diam
+                print(f"❌ Terjadi Error pada pemrosesan stasiun: {e}")
             
     plugins.TimestampedGeoJson({'type': 'FeatureCollection', 'features': all_features}, period='PT30M', add_last_point=True, auto_play=False, loop=False, max_speed=1, time_slider_drag_update=True, duration='PT30M').add_to(m)
     return m, all_telegram_alerts
@@ -642,13 +647,11 @@ def send_telegram_alert(token, chat_id, alerts_list, repo):
     print(f"⚠️ Mengirim {len(alerts_list)} peringatan MERAH ke Telegram...")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     
-    # 1. Kirim Pesan Intro (Judul)
     intro = f"⚠️ <b>WIRAAVIA ALERT: {len(alerts_list)} STASIUN BUTUH AMD TAF!</b> ⚠️\n🌍 <b>Cek Peta Penuh:</b> https://{repo.split('/')[0]}.github.io/{repo.split('/')[1]}/"
     try:
         requests.post(url, json={"chat_id": chat_id, "text": intro, "parse_mode": "HTML"})
     except: pass
     
-    # 2. Kirim masing-masing peringatan stasiun secara terpisah (Mencegah Limit Teks Telegram)
     for alert in alerts_list:
         payload = {"chat_id": chat_id, "text": alert, "parse_mode": "HTML"}
         try:
@@ -657,7 +660,7 @@ def send_telegram_alert(token, chat_id, alerts_list, repo):
                 print(f"❌ Gagal kirim Telegram untuk 1 stasiun: {res.text}")
         except Exception:
             pass
-        time.sleep(0.5) # Anti-Spam Telegram API
+        time.sleep(0.5) 
         
     print("📲 Semua Notifikasi Telegram berhasil diproses!")
 
@@ -672,13 +675,18 @@ if __name__ == "__main__":
     
     dashboard_map, alert_messages = create_dynamic_webgis(df_bandara)
     
-    html_filename = "Dashboard_RealTime_Final.html"
-    dashboard_map.save(html_filename)
-    # webbrowser.open('file://' + os.path.abspath(html_filename)) # Opsional, dimatikan agar aman di GitHub Actions
-    
-    html_string = dashboard_map.get_root().render()
-    push_to_github(html_string, GITHUB_TOKEN, GITHUB_REPO)
-    send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, alert_messages, GITHUB_REPO)
+    # Hanya render dan push jika peta tidak kosong
+    if dashboard_map:
+        html_string = dashboard_map.get_root().render()
+        if GITHUB_TOKEN:
+            push_to_github(html_string, GITHUB_TOKEN, GITHUB_REPO)
+        else:
+            print("⚠️ Token GitHub tidak ditemukan. Peta tidak diupload.")
+        
+        if TELEGRAM_BOT_TOKEN:
+            send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, alert_messages, GITHUB_REPO)
+    else:
+        print("❌ Peta gagal dibuat (Semua Data Kosong).")
     
     durasi = time.time() - mulai
     print("==================================================")
