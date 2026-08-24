@@ -18,12 +18,12 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ==========================================
 GITHUB_TOKEN = os.getenv('MY_GITHUB_TOKEN')
 GITHUB_REPO = 'Azan-Lab1772/wiraavia'
-
 TELEGRAM_BOT_TOKEN = os.getenv('TELE_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELE_CHAT_ID')
 
-# 🔥 URL CLOUDFLARE WORKER ANDA
+# 🔥 PROXY CLOUDFLARE ANDA & API TOKEN BMKG
 URL_PROXY_ANDA = "https://proxy-bmkg.azan-kanezar.workers.dev"
+API_TOKEN = '37da31a5cc6f0732732a7f9c640507b2849e37a3b815b0252af2a54afc7a'
 
 # ==========================================
 # 1. LOAD DATA STASIUN BANDARA
@@ -59,17 +59,21 @@ data_csv = """No,ICAO,Nama_Bandara,Lintang,Bujur,WMO
 29,WAKK,MOPAH,-8.521111, 140.416944,97980"""
 df_bandara = pd.read_csv(io.StringIO(data_csv))
 
-session = requests.Session()
-
 # ==========================================
 # 2. ENGINE PENARIKAN DATA (VIA CLOUDFLARE PROXY)
 # ==========================================
+session = requests.Session()
+# Tidak perlu lagi mengirim API Token dari sini!
+session.headers.update({
+    'accept': '*/*',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+})
+
 def get_weather_data(icao, data_type, count=45):
-    # Menggunakan Cloudflare Worker sebagai perantara
     url = f"{URL_PROXY_ANDA}/api/v1/{data_type}/{icao.lower()}"
     try:
-        # Timeout bisa disingkat karena Cloudflare sangat cepat
-        res = session.get(url, timeout=10, verify=False)
+        # Cukup tunggu 8 detik, jika server aman data pasti langsung masuk
+        res = session.get(url, timeout=8, verify=False)
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list) and len(data) == 0: return []
@@ -78,10 +82,12 @@ def get_weather_data(icao, data_type, count=45):
                 weather_list = data[icao_upper]
                 if isinstance(weather_list, list) and len(weather_list) > 0:
                     return [w.get('data_text', "") for w in weather_list[:count]]
-    except Exception:
-        pass
+        else:
+            print(f"Error {icao}: Ditolak dengan kode {res.status_code}")
+    except Exception as e:
+        print(f"Error {icao}: {e}")
     return []
-
+    
 # ==========================================
 # 3. FUNGSI ASISTEN NWP & EVALUATOR
 # ==========================================
@@ -179,7 +185,7 @@ def get_nwp_forecast(lat, lon, status_color, l2_reasons):
 
                 if status_color == 'green': 
                     kesimpulan = f"METAR Aktual terpantau Normal. {teks_trend}"
-                    saran = "Tidak ada indikasi untuk Amandemen TAF saat ini."
+                    saran = "Tidak ada indikasi untuk Amandemen TAF saat ini. Lanjutkan pemantauan kondisi aktual."
                 elif status_color == '#D4AC0D': 
                     kesimpulan = f"Terdapat fluktuasi cuaca via observasi (Laporan SPECI). {teks_trend}"
                     saran = "Tingkatkan kewaspadaan observasi. Jadikan model NWP di atas sebagai acuan durasi."
@@ -350,6 +356,8 @@ def evaluate_snapshot(curr_metar_str, taf_str, eval_dt, has_speci):
 
 def process_airport(row, grid_times):
     icao = row['ICAO']
+    time.sleep(1) # Jeda ringan anti-spam
+    
     metars = get_weather_data(icao, 'metar', 45)
     specis = get_weather_data(icao, 'speci', 20)
     tafs = get_weather_data(icao, 'taf', 1)
@@ -466,7 +474,7 @@ def process_airport(row, grid_times):
 
 def create_dynamic_webgis(df):
     m = folium.Map(location=[-2.5, 118.0], zoom_start=5, tiles='cartodbdark_matter')
-    folium.TileLayer('openstreetmap', name='Standard Maps').add_to(m)
+    folium.TileLayer('openstreetmap', name='Standard Maps (Minimal)').add_to(m)
     folium.TileLayer(tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr='Esri', name='Satellite Imagery').add_to(m)
     folium.LayerControl().add_to(m)
     
@@ -474,6 +482,7 @@ def create_dynamic_webgis(df):
     m.get_root().html.add_child(folium.Element(f'''
     <div align="center" style="position: absolute; z-index: 9999; top: 15px; left: 50%; transform: translateX(-50%); background-color: rgba(44, 62, 80, 0.95); padding: 10px 25px; border-radius: 8px; border: 1px solid #34495E; font-family: Arial; text-align: center;">
         <h3 style="font-size:22px; font-weight:bold; color: #ECF0F1; margin: 0; padding: 0;">WiraAvia</h3>
+        <p style="font-size:12px; font-style: italic; color: #BDC3C7; margin: 4px 0 0 0; padding: 0;">(Web-gis Interface for Rapid Assessment of Aviation Weather)</p>
         <p style="font-size:10px; color: #F1C40F; margin: 5px 0 0 0; padding: 0;">Last Server Fetch: {update_time_str}</p>
     </div>
     <div style="position: fixed; bottom: 80px; left: 30px; width: 280px; background-color: rgba(44, 62, 80, 0.95); color: #ECF0F1; z-index:9999; font-size:13px; font-family: Arial; border: 1px solid #34495E; border-radius: 8px; padding: 15px;">
@@ -486,10 +495,12 @@ def create_dynamic_webgis(df):
 
     all_features, all_telegram_alerts = [], []
     now = datetime.now(timezone.utc)
-    latest_grid = now.replace(minute=30 if now.minute >= 30 else 0, second=0, microsecond=0)
-    grid_times = [latest_grid - timedelta(minutes=30 * i) for i in range(2)][::-1]
+    minute_grid = 30 if now.minute >= 30 else 0
+    latest_grid = now.replace(minute=minute_grid, second=0, microsecond=0)
+    grid_times = [latest_grid - timedelta(minutes=30 * i) for i in range(2)]
+    grid_times.reverse() 
 
-    print(f"🚀 Memproses {len(df)} Bandara via Cloudflare Proxy...")
+    print(f"🚀 Memproses {len(df)} Bandara (Via Proxy Cloudflare)...")
     for index, row in df.iterrows():
         try:
             f_list, a_list = process_airport(row, grid_times)
@@ -498,7 +509,9 @@ def create_dynamic_webgis(df):
         except Exception as e:
             print(f"❌ Terjadi Error pada {row['ICAO']}: {e}")
             
-    if not all_features: return None, []
+    if not all_features:
+        return None, []
+        
     plugins.TimestampedGeoJson({'type': 'FeatureCollection', 'features': all_features}, period='PT30M', add_last_point=True, auto_play=False, loop=False, max_speed=1, time_slider_drag_update=True, duration='PT30M').add_to(m)
     return m, all_telegram_alerts
 
@@ -514,19 +527,37 @@ def push_to_github(html_string, token, repo, path="index.html"):
     data = {"message": f"Auto-update Peta WiraAvia {datetime.now().strftime('%H:%M:%S')}", "content": encoded_content, "branch": "main"}
     if sha: data["sha"] = sha 
 
-    res = requests.put(url, headers=headers, json=data)
-    if res.status_code in [200, 201]: print("✅ Peta berhasil diterbangkan ke Internet!")
-    else: print(f"❌ GAGAL UPLOAD: Kode {res.status_code}")
+    put_response = requests.put(url, headers=headers, json=data)
+    if put_response.status_code in [200, 201]:
+        print("✅ Peta berhasil diterbangkan ke Internet!")
+        print(f"🌍 Link Web Anda: https://{repo.split('/')[0]}.github.io/{repo.split('/')[1]}/")
+    else:
+        print(f"❌ GAGAL UPLOAD: Kode {put_response.status_code}")
 
 def send_telegram_alert(token, chat_id, alerts_list, repo):
-    if not alerts_list: return
+    if not alerts_list:
+        print("✅ Peta aman, tidak ada status MERAH. (Telegram standby).")
+        return
+    
+    print(f"⚠️ Mengirim {len(alerts_list)} peringatan MERAH ke Telegram...")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try: requests.post(url, json={"chat_id": chat_id, "text": f"⚠️ <b>WIRAAVIA ALERT: {len(alerts_list)} STASIUN BUTUH AMD TAF!</b> ⚠️\n🌍 <b>Cek Peta Penuh:</b> https://{repo.split('/')[0]}.github.io/{repo.split('/')[1]}/", "parse_mode": "HTML"})
+    
+    intro = f"⚠️ <b>WIRAAVIA ALERT: {len(alerts_list)} STASIUN BUTUH AMD TAF!</b> ⚠️\n🌍 <b>Cek Peta Penuh:</b> https://{repo.split('/')[0]}.github.io/{repo.split('/')[1]}/"
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": intro, "parse_mode": "HTML"})
     except: pass
+    
     for alert in alerts_list:
-        try: requests.post(url, json={"chat_id": chat_id, "text": alert, "parse_mode": "HTML"})
-        except: pass
+        payload = {"chat_id": chat_id, "text": alert, "parse_mode": "HTML"}
+        try:
+            res = requests.post(url, json=payload)
+            if res.status_code != 200:
+                print(f"❌ Gagal kirim Telegram untuk 1 stasiun: {res.text}")
+        except Exception:
+            pass
         time.sleep(0.5) 
+        
+    print("📲 Semua Notifikasi Telegram berhasil diproses!")
 
 if __name__ == "__main__":
     print("==================================================")
