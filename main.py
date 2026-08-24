@@ -1,8 +1,7 @@
 import pandas as pd
 import folium
 from folium import plugins
-import requests
-import urllib3
+from curl_cffi import requests
 import io
 import os
 import time
@@ -10,19 +9,14 @@ import re
 import base64
 from datetime import datetime, timedelta, timezone
 
-# Matikan peringatan SSL agar bypass proxy lancar di server GitHub Actions
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 # ==========================================
-# KONFIGURASI TOKENS & PROXY
+# KONFIGURASI TOKENS
 # ==========================================
 GITHUB_TOKEN = os.getenv('MY_GITHUB_TOKEN')
 GITHUB_REPO = 'Azan-Lab1772/wiraavia'
 TELEGRAM_BOT_TOKEN = os.getenv('TELE_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELE_CHAT_ID')
 
-# 🔥 PROXY CLOUDFLARE ANDA & API TOKEN BMKG
-URL_PROXY_ANDA = "https://proxy-bmkg.azan-kanezar.workers.dev"
 API_TOKEN = '37da31a5cc6f0732732a7f9c640507b2849e37a3b815b0252af2a54afc7a'
 
 # ==========================================
@@ -60,34 +54,37 @@ data_csv = """No,ICAO,Nama_Bandara,Lintang,Bujur,WMO
 df_bandara = pd.read_csv(io.StringIO(data_csv))
 
 # ==========================================
-# 2. ENGINE PENARIKAN DATA (VIA CLOUDFLARE PROXY)
+# 2. ENGINE ANTI-WAF BMKG (CURL_CFFI IMPERSONATE)
 # ==========================================
-session = requests.Session()
-# Tidak perlu lagi mengirim API Token dari sini!
+# 🔥 Meniru Sidik Jari Google Chrome 110 secara 100% sempurna
+session = requests.Session(impersonate="chrome110")
 session.headers.update({
-    'accept': '*/*',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    'Authorization': f'Bearer {API_TOKEN}',
+    'Accept': 'application/json, text/plain, */*',
+    'Origin': 'https://web-aviation.bmkg.go.id',
+    'Referer': 'https://web-aviation.bmkg.go.id/'
 })
 
 def get_weather_data(icao, data_type, count=45):
-    url = f"{URL_PROXY_ANDA}/api/v1/{data_type}/{icao.lower()}"
-    try:
-        # Cukup tunggu 8 detik, jika server aman data pasti langsung masuk
-        res = session.get(url, timeout=8, verify=False)
-        if res.status_code == 200:
-            data = res.json()
-            if isinstance(data, list) and len(data) == 0: return []
-            icao_upper = icao.upper()
-            if isinstance(data, dict) and icao_upper in data:
-                weather_list = data[icao_upper]
-                if isinstance(weather_list, list) and len(weather_list) > 0:
-                    return [w.get('data_text', "") for w in weather_list[:count]]
-        else:
-            print(f"Error {icao}: Ditolak dengan kode {res.status_code}")
-    except Exception as e:
-        print(f"Error {icao}: {e}")
+    url = f"https://web-aviation.bmkg.go.id/api/v1/{data_type}/{icao.lower()}"
+    for attempt in range(3): # Sistem Retry Manual
+        try:
+            res = session.get(url, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) == 0: return []
+                icao_upper = icao.upper()
+                if isinstance(data, dict) and icao_upper in data:
+                    weather_list = data[icao_upper]
+                    if isinstance(weather_list, list) and len(weather_list) > 0:
+                        return [w.get('data_text', "") for w in weather_list[:count]]
+                return []
+            else:
+                time.sleep(2) # Jeda jika terjadi gangguan sementara
+        except Exception as e:
+            time.sleep(2)
     return []
-    
+
 # ==========================================
 # 3. FUNGSI ASISTEN NWP & EVALUATOR
 # ==========================================
@@ -105,7 +102,7 @@ def get_nwp_forecast(lat, lon, status_color, l2_reasons):
            f"hourly=pressure_msl,weather_code,wind_speed_10m,wind_direction_10m&"
            f"models=ecmwf_ifs025,gfs_seamless,icon_global&timezone=UTC&wind_speed_unit=kn")
     try:
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10, verify=False)
+        res = session.get(url, timeout=10)
         if res.status_code == 200:
             data = res.json()
             if 'hourly' not in data: return "Data model tidak tersedia.", "Data NWP Kosong."
@@ -185,7 +182,7 @@ def get_nwp_forecast(lat, lon, status_color, l2_reasons):
 
                 if status_color == 'green': 
                     kesimpulan = f"METAR Aktual terpantau Normal. {teks_trend}"
-                    saran = "Tidak ada indikasi untuk Amandemen TAF saat ini. Lanjutkan pemantauan kondisi aktual."
+                    saran = "Tidak ada indikasi untuk Amandemen TAF saat ini."
                 elif status_color == '#D4AC0D': 
                     kesimpulan = f"Terdapat fluktuasi cuaca via observasi (Laporan SPECI). {teks_trend}"
                     saran = "Tingkatkan kewaspadaan observasi. Jadikan model NWP di atas sebagai acuan durasi."
@@ -356,7 +353,7 @@ def evaluate_snapshot(curr_metar_str, taf_str, eval_dt, has_speci):
 
 def process_airport(row, grid_times):
     icao = row['ICAO']
-    time.sleep(1) # Jeda ringan anti-spam
+    time.sleep(1) # Jeda anti-spam
     
     metars = get_weather_data(icao, 'metar', 45)
     specis = get_weather_data(icao, 'speci', 20)
@@ -500,7 +497,7 @@ def create_dynamic_webgis(df):
     grid_times = [latest_grid - timedelta(minutes=30 * i) for i in range(2)]
     grid_times.reverse() 
 
-    print(f"🚀 Memproses {len(df)} Bandara (Via Proxy Cloudflare)...")
+    print(f"🚀 Memproses {len(df)} Bandara (CURL_CFFI Bypass)...")
     for index, row in df.iterrows():
         try:
             f_list, a_list = process_airport(row, grid_times)
@@ -561,7 +558,7 @@ def send_telegram_alert(token, chat_id, alerts_list, repo):
 
 if __name__ == "__main__":
     print("==================================================")
-    print("MENGHIDUPKAN WIRAAVIA (Sistem Final Cloudflare Proxy)")
+    print("MENGHIDUPKAN WIRAAVIA (Sistem Final CURL_CFFI Bypass)")
     print("==================================================")
     mulai = time.time()
     
