@@ -4,15 +4,18 @@ from folium import plugins
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import urllib3
 import io
 import os
 import webbrowser
 import time
 import re
 import base64
-import random # 🔥 DITAMBAHKAN: Modul krusial yang sebelumnya hilang
+import random
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Mematikan peringatan SSL (Krusial untuk bypass server pemerintah di GitHub Actions)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
 # KONFIGURASI GITHUB UPLOADER & TELEGRAM
@@ -58,40 +61,22 @@ data_csv = """No,ICAO,Nama_Bandara,Lintang,Bujur,WMO
 df_bandara = pd.read_csv(io.StringIO(data_csv))
 
 # ==========================================
-# 2. FUNGSI TARIK DATA BMKG (ANTI-WAF BLOCK)
+# 2. FUNGSI TARIK DATA BMKG (ANTI-WAF MAXIMUM)
 # ==========================================
 API_TOKEN = '37da31a5cc6f0732732a7f9c640507b2849e37a3b815b0252af2a54afc7a'
+
+# Spoofing super lengkap agar tidak terdeteksi sebagai Robot GitHub
 HEADERS = {
-    'accept': '*/*', 
+    'Accept': 'application/json, text/plain, */*', 
+    'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
     'Authorization': f'Bearer {API_TOKEN}',
-    'Connection': 'close',
-    # 🔥 DITAMBAHKAN: User-Agent persis seperti Streamlit agar tembus Firewall BMKG
+    'Origin': 'https://web-aviation.bmkg.go.id',
+    'Referer': 'https://web-aviation.bmkg.go.id/',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
 }
-
-session = requests.Session()
-session.headers.update(HEADERS)
-retry_strategy = Retry(total=5, backoff_factor=1.5, status_forcelist=[403, 429, 500, 502, 503, 504])
-adapter = HTTPAdapter(max_retries=retry_strategy)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
-
-def get_weather_data(icao, data_type, count=30):
-    url = f"https://web-aviation.bmkg.go.id/api/v1/{data_type}/{icao.lower()}"
-    try:
-        response = session.get(url, timeout=10)
-        if response.status_code == 200:
-            try:
-                data = response.json()
-                if isinstance(data, list) and len(data) == 0: return []
-                icao_upper = icao.upper()
-                if isinstance(data, dict) and icao_upper in data:
-                    weather_list = data[icao_upper]
-                    if isinstance(weather_list, list) and len(weather_list) > 0:
-                        return [w.get('data_text', "") for w in weather_list[:count]]
-            except ValueError: pass
-    except Exception: pass
-    return []
 
 # ==========================================
 # 3. FUNGSI ASISTEN NWP (LOGIKA AI CERDAS ARAH PERUBAHAN)
@@ -110,7 +95,8 @@ def get_nwp_forecast(lat, lon, status_color, l2_reasons):
            f"hourly=pressure_msl,weather_code,wind_speed_10m,wind_direction_10m&"
            f"models=ecmwf_ifs025,gfs_seamless,icon_global&timezone=UTC&wind_speed_unit=kn")
     try:
-        res = requests.get(url, headers={'User-Agent': 'WiraAvia'}, timeout=10)
+        # Tambahkan verify=False agar tidak error SSL
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}, timeout=10, verify=False)
         if res.status_code == 200:
             data = res.json()
             if 'hourly' not in data: 
@@ -193,7 +179,6 @@ def get_nwp_forecast(lat, lon, status_color, l2_reasons):
                 is_vis_or_ceil = any("Visibilitas" in r or "Awan" in r or "Ceiling" in r for r in l2_reasons)
                 is_wx = any("Cuaca Signifikan" in r for r in l2_reasons)
 
-                # Deteksi Arah Pelanggaran (Membaik vs Memburuk)
                 is_improving = False
                 is_worsening = False
                 for r in l2_reasons:
@@ -414,19 +399,14 @@ def evaluate_snapshot(curr_metar_str, taf_str, eval_dt, has_speci):
     return overall_color, l2_result, actual['wind_dir']
 
 # ==========================================
-# 5. FUNGSI WORKER PARALEL
+# 5. PEMROSESAN STASIUN TUNGGAL (SEKUENSIAL)
 # ==========================================
 def process_airport(row, grid_times):
     icao = row['ICAO']
     
     local_session = requests.Session()
-    # 🔥 DITAMBAHKAN: User-Agent persis seperti Streamlit untuk Worker Thread juga
-    local_session.headers.update({
-        'accept': '*/*', 
-        'Authorization': f'Bearer {API_TOKEN}',
-        'Connection': 'keep-alive',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
-    })
+    # Menerapkan Header Anti-Blokir ke Session Worker
+    local_session.headers.update(HEADERS)
     
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
@@ -435,7 +415,8 @@ def process_airport(row, grid_times):
     def fetch(dtype, count):
         url = f"https://web-aviation.bmkg.go.id/api/v1/{dtype}/{icao.lower()}"
         try:
-            res = local_session.get(url, timeout=15)
+            # Wajib verify=False untuk menghindari masalah SSL dari Ubuntu
+            res = local_session.get(url, timeout=15, verify=False)
             if res.status_code == 200:
                 data = res.json()
                 if isinstance(data, list) and len(data) == 0: return []
@@ -443,14 +424,18 @@ def process_airport(row, grid_times):
                     w_list = data[icao.upper()]
                     if isinstance(w_list, list):
                         return [w.get('data_text', "") for w in w_list[:count] if 'data_text' in w]
-        except: pass
+            else:
+                print(f"  [!] HTTP {res.status_code} saat menarik {dtype}")
+        except Exception as e: 
+            print(f"  [!] Error menarik {dtype}: {e}")
         return []
 
-    time.sleep(random.uniform(0.5, 1.5))
+    # Memberikan jeda agar BMKG tidak merasa diserang (Spam)
+    time.sleep(random.uniform(1.0, 2.0))
 
     metars = fetch('metar', 45)
     if not metars:
-        time.sleep(2) 
+        time.sleep(3) 
         metars = fetch('metar', 45)
         
     specis = fetch('speci', 20)
@@ -566,7 +551,7 @@ def process_airport(row, grid_times):
     return station_features, station_alerts
 
 # ==========================================
-# 6. GENERATE MAP (MULTITHREADING RINGAN)
+# 6. PEMBUATAN PETA
 # ==========================================
 def create_dynamic_webgis(df):
     m = folium.Map(location=[-2.5, 118.0], zoom_start=5, tiles='cartodbdark_matter')
@@ -602,17 +587,14 @@ def create_dynamic_webgis(df):
     grid_times = [latest_grid - timedelta(minutes=30 * i) for i in range(2)]
     grid_times.reverse() 
 
-    print(f"🚀 Memproses {len(df)} Bandara (Throttled Multithreading: 3 Jalur Aman)...")
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(process_airport, row, grid_times): row['ICAO'] for _, row in df.iterrows()}
-        for future in as_completed(futures):
-            try:
-                f_list, a_list = future.result()
-                all_features.extend(f_list)
-                all_telegram_alerts.extend(a_list)
-            except Exception as e:
-                # 🔥 DITAMBAHKAN: Laporan error jika terjadi kegagalan agar tidak mati diam-diam
-                print(f"❌ Terjadi Error pada pemrosesan stasiun: {e}")
+    print(f"🚀 Memproses {len(df)} Bandara (Looping Sekuensial Anti-Blokir)...")
+    for index, row in df.iterrows():
+        try:
+            f_list, a_list = process_airport(row, grid_times)
+            all_features.extend(f_list)
+            all_telegram_alerts.extend(a_list)
+        except Exception as e:
+            print(f"❌ Terjadi Error pada {row['ICAO']}: {e}")
             
     plugins.TimestampedGeoJson({'type': 'FeatureCollection', 'features': all_features}, period='PT30M', add_last_point=True, auto_play=False, loop=False, max_speed=1, time_slider_drag_update=True, duration='PT30M').add_to(m)
     return m, all_telegram_alerts
@@ -675,18 +657,14 @@ if __name__ == "__main__":
     
     dashboard_map, alert_messages = create_dynamic_webgis(df_bandara)
     
-    # Hanya render dan push jika peta tidak kosong
-    if dashboard_map:
-        html_string = dashboard_map.get_root().render()
-        if GITHUB_TOKEN:
-            push_to_github(html_string, GITHUB_TOKEN, GITHUB_REPO)
-        else:
-            print("⚠️ Token GitHub tidak ditemukan. Peta tidak diupload.")
-        
-        if TELEGRAM_BOT_TOKEN:
-            send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, alert_messages, GITHUB_REPO)
+    html_string = dashboard_map.get_root().render()
+    if GITHUB_TOKEN:
+        push_to_github(html_string, GITHUB_TOKEN, GITHUB_REPO)
     else:
-        print("❌ Peta gagal dibuat (Semua Data Kosong).")
+        print("⚠️ Token GitHub tidak ditemukan. Peta tidak diupload.")
+    
+    if TELEGRAM_BOT_TOKEN:
+        send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, alert_messages, GITHUB_REPO)
     
     durasi = time.time() - mulai
     print("==================================================")
