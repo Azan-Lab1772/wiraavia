@@ -14,7 +14,7 @@ import base64
 import random
 from datetime import datetime, timedelta, timezone
 
-# Mematikan peringatan SSL (Krusial untuk bypass server pemerintah di GitHub Actions)
+# Matikan peringatan SSL agar bypass proxy lancar di server Linux/GitHub Actions
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
@@ -61,22 +61,47 @@ data_csv = """No,ICAO,Nama_Bandara,Lintang,Bujur,WMO
 df_bandara = pd.read_csv(io.StringIO(data_csv))
 
 # ==========================================
-# 2. FUNGSI TARIK DATA BMKG (ANTI-WAF MAXIMUM)
+# 2. ENGINE PENARIKAN DATA BMKG (DILENGKAPI PROXY BYPASS)
 # ==========================================
 API_TOKEN = '37da31a5cc6f0732732a7f9c640507b2849e37a3b815b0252af2a54afc7a'
-
-# Spoofing super lengkap agar tidak terdeteksi sebagai Robot GitHub
 HEADERS = {
-    'Accept': 'application/json, text/plain, */*', 
-    'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
+    'accept': '*/*', 
     'Authorization': f'Bearer {API_TOKEN}',
-    'Origin': 'https://web-aviation.bmkg.go.id',
-    'Referer': 'https://web-aviation.bmkg.go.id/',
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'same-origin',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 }
+
+session = requests.Session()
+session.headers.update(HEADERS)
+retry_strategy = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+def get_weather_data(icao, data_type, count=45):
+    target_url = f"https://web-aviation.bmkg.go.id/api/v1/{data_type}/{icao.lower()}"
+    
+    # 🔥 STRATEGI ANTI-BLOKIR: Jalur Utama + 2 Jalur Tikus (Proxy)
+    routes = [
+        target_url, # Jalur 1: Coba tembus langsung
+        f"https://api.allorigins.win/raw?url={target_url}", # Jalur 2: Proxy AllOrigins
+        f"https://corsproxy.io/?{target_url}" # Jalur 3: Proxy CORS
+    ]
+    
+    for url in routes:
+        try:
+            res = session.get(url, timeout=15, verify=False)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) == 0: return []
+                icao_upper = icao.upper()
+                if isinstance(data, dict) and icao_upper in data:
+                    weather_list = data[icao_upper]
+                    if isinstance(weather_list, list) and len(weather_list) > 0:
+                        return [w.get('data_text', "") for w in weather_list[:count]]
+        except Exception:
+            continue # Jika jalur ini diblokir/error, lanjut ke jalur tikus berikutnya
+            
+    return [] # Jika ketiga jalur diblokir total
 
 # ==========================================
 # 3. FUNGSI ASISTEN NWP (LOGIKA AI CERDAS ARAH PERUBAHAN)
@@ -95,8 +120,7 @@ def get_nwp_forecast(lat, lon, status_color, l2_reasons):
            f"hourly=pressure_msl,weather_code,wind_speed_10m,wind_direction_10m&"
            f"models=ecmwf_ifs025,gfs_seamless,icon_global&timezone=UTC&wind_speed_unit=kn")
     try:
-        # Tambahkan verify=False agar tidak error SSL
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}, timeout=10, verify=False)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10, verify=False)
         if res.status_code == 200:
             data = res.json()
             if 'hourly' not in data: 
@@ -179,6 +203,7 @@ def get_nwp_forecast(lat, lon, status_color, l2_reasons):
                 is_vis_or_ceil = any("Visibilitas" in r or "Awan" in r or "Ceiling" in r for r in l2_reasons)
                 is_wx = any("Cuaca Signifikan" in r for r in l2_reasons)
 
+                # Deteksi Arah Pelanggaran (Membaik vs Memburuk)
                 is_improving = False
                 is_worsening = False
                 for r in l2_reasons:
@@ -348,15 +373,15 @@ def evaluate_snapshot(curr_metar_str, taf_str, eval_dt, has_speci):
             dir_diff = abs(actual['wind_dir'] - forecast['wind_dir'])
             dir_diff = 360 - dir_diff if dir_diff > 180 else dir_diff
             if dir_diff >= 60 and ((actual['wind_spd'] or 0) >= 10 or (forecast['wind_spd'] or 0) >= 10):
-                l2_reasons.append(f"Pergeseran Arah Angin: Aktual {actual['wind_dir']}° vs TAF {forecast['wind_dir']}° (Selisih >= 60° dengan kecepatan angin >= 10kt).")
+                l2_reasons.append(f"Pergeseran Arah Angin: Aktual {actual['wind_dir']}° vs TAF {forecast['wind_dir']}° (Selisih ≥ 60° dengan kecepatan angin ≥ 10kt).")
                 l2_level = 2
         if actual['wind_spd'] is not None and forecast['wind_spd'] is not None and abs(actual['wind_spd'] - forecast['wind_spd']) >= 10:
-            l2_reasons.append(f"Kecepatan Angin: Aktual {actual['wind_spd']}kt vs TAF {forecast['wind_spd']}kt (Selisih >= 10kt).")
+            l2_reasons.append(f"Kecepatan Angin: Aktual {actual['wind_spd']}kt vs TAF {forecast['wind_spd']}kt (Selisih ≥ 10kt).")
             l2_level = 2
         act_gst = actual.get('wind_spd_gust') or actual['wind_spd']
         fct_gst = forecast.get('wind_spd_gust') or forecast['wind_spd']
         if act_gst is not None and fct_gst is not None and abs(act_gst - fct_gst) >= 10 and ((actual['wind_spd'] or 0) >= 15 or (forecast['wind_spd'] or 0) >= 15):
-            l2_reasons.append(f"Wind Gust Dev: Selisih hembusan (Gust) mencapai {abs(act_gst - fct_gst)}kt dengan kecepatan dasar >= 15kt.")
+            l2_reasons.append(f"Wind Gust Dev: Selisih hembusan (Gust) mencapai {abs(act_gst - fct_gst)}kt dengan kecepatan dasar ≥ 15kt.")
             l2_level = 2
         if (actual['wind_spd'] or 0) >= 20:
             l2_reasons.append(f"Wind Operational Threshold: Kecepatan angin aktual ({actual['wind_spd']}kt) melampaui batas aman komparasi.")
@@ -399,159 +424,7 @@ def evaluate_snapshot(curr_metar_str, taf_str, eval_dt, has_speci):
     return overall_color, l2_result, actual['wind_dir']
 
 # ==========================================
-# 5. PEMROSESAN STASIUN TUNGGAL (SEKUENSIAL)
-# ==========================================
-def process_airport(row, grid_times):
-    icao = row['ICAO']
-    
-    local_session = requests.Session()
-    # Menerapkan Header Anti-Blokir ke Session Worker
-    local_session.headers.update(HEADERS)
-    
-    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry)
-    local_session.mount("https://", adapter)
-    
-    def fetch(dtype, count):
-        url = f"https://web-aviation.bmkg.go.id/api/v1/{dtype}/{icao.lower()}"
-        try:
-            # Wajib verify=False untuk menghindari masalah SSL dari Ubuntu
-            res = local_session.get(url, timeout=15, verify=False)
-            if res.status_code == 200:
-                data = res.json()
-                if isinstance(data, list) and len(data) == 0: return []
-                if isinstance(data, dict) and icao.upper() in data:
-                    w_list = data[icao.upper()]
-                    if isinstance(w_list, list):
-                        return [w.get('data_text', "") for w in w_list[:count] if 'data_text' in w]
-            else:
-                print(f"  [!] HTTP {res.status_code} saat menarik {dtype}")
-        except Exception as e: 
-            print(f"  [!] Error menarik {dtype}: {e}")
-        return []
-
-    # Memberikan jeda agar BMKG tidak merasa diserang (Spam)
-    time.sleep(random.uniform(1.0, 2.0))
-
-    metars = fetch('metar', 45)
-    if not metars:
-        time.sleep(3) 
-        metars = fetch('metar', 45)
-        
-    specis = fetch('speci', 20)
-    tafs = fetch('taf', 1)
-    taf_str = tafs[0] if len(tafs) > 0 else "NIL"
-    
-    if metars:
-        print(f"✅ {icao} Berhasil")
-    else:
-        print(f"❌ {icao} Kosong (Akan tampil abu-abu)")
-
-    parsed_metars = [ (extract_time_components(m), m) for m in metars if extract_time_components(m) ]
-    parsed_specis = [ (extract_time_components(s), s) for s in specis if extract_time_components(s) ]
-
-    station_features = []
-    station_alerts = []
-
-    final_color = 'green'
-    final_reasons = []
-    for grid_time in grid_times:
-        curr_metar = find_closest_data_by_grid_logic(grid_time, parsed_metars)
-        has_speci = any(0 <= (grid_time.hour * 60 + grid_time.minute) - (comp['hour'] * 60 + comp['minute']) <= 30 for comp, _ in parsed_specis if comp)
-        c, l2_res, _ = evaluate_snapshot(curr_metar, taf_str, grid_time, has_speci)
-        if grid_time == grid_times[-1]: 
-            final_color = c
-            final_reasons = l2_res['reasons']
-
-    nwp_html, nwp_tg = get_nwp_forecast(row['Lintang'], row['Bujur'], final_color, final_reasons)
-
-    nwp_section = ""
-    if nwp_html:
-        nwp_section = f"""
-        <details style="margin-top: 15px; margin-bottom: 10px; background: #ffffff; border: 1px solid #17a2b8; border-radius: 5px;">
-            <summary style="padding: 8px 10px; font-size: 11px; font-weight: bold; color: #0c5460; background-color: #d1ecf1; cursor: pointer; outline: none; border-radius: 4px;">
-                📊 PERTIMBANGAN MODEL NWP (Klik untuk buka)
-            </summary>
-            <div style="padding: 10px; font-size: 10px; line-height: 1.5; white-space: nowrap; overflow-x: auto;">
-                {nwp_html}
-            </div>
-        </details>
-        """
-
-    for grid_time in grid_times:
-        curr_metar = find_closest_data_by_grid_logic(grid_time, parsed_metars)
-        
-        target_mins = grid_time.hour * 60 + grid_time.minute
-        speci_alert_str = "NIL (Tidak ada SPECI relevan)"
-        has_speci = False
-        for comp, s_str in parsed_specis:
-            data_mins = comp['hour'] * 60 + comp['minute']
-            diff = target_mins - data_mins
-            if diff < -720: diff += 1440
-            elif diff > 720: diff -= 1440
-            if 0 <= diff <= 30:
-                has_speci, speci_alert_str = True, s_str
-                break
-        
-        color, l2_res, wind_dir_int = evaluate_snapshot(curr_metar, taf_str, grid_time, has_speci)
-        
-        if grid_time == grid_times[-1] and color == 'red':
-            alasan = "\n- ".join(l2_res['reasons'])
-            waktu_generate = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
-            pesan_alert = (
-                f"🚨 <b>{icao} ({row['Nama_Bandara']})</b>\n"
-                f"⏱ <b>Waktu Generate:</b> {waktu_generate}\n"
-                f"<b>Status:</b> REKOMENDASI AMD TAF\n"
-                f"<b>Penyebab:</b>\n- {alasan}\n\n"
-                f"<b>[ METAR AKTUAL ]</b>\n<code>{curr_metar}</code>\n\n"
-                f"<b>[ TAF TERBARU ]</b>\n<code>{taf_str}</code>\n\n"
-                f"<b>[ 🤖 ASISTEN TAF ]</b>\n{nwp_tg}"
-            )
-            station_alerts.append(pesan_alert)
-
-        l2_html = "".join([f"<li>{r}</li>" for r in l2_res['reasons']])
-        curr_comp = extract_time_components(curr_metar)
-        jam_label = f"{curr_comp['hour']:02d}:{curr_comp['minute']:02d} UTC" if curr_comp else grid_time.strftime("%H:%M UTC")
-        
-        popup_html = f"""
-        <div style="max-width: 380px; min-width: 250px; width: max-content; font-family: Arial, sans-serif; white-space: normal;">
-            <div style="background-color: {color if color != '#D4AC0D' else '#D4AC0D'}; color: {'black' if color == '#D4AC0D' else 'white'}; padding: 10px; border-radius: 5px 5px 0 0; text-align: center;">
-                <h4 style="margin: 0; font-weight: bold;">{icao} <span style="font-size:12px; font-weight:normal;">({jam_label})</span></h4>
-                <p style="margin: 5px 0 0 0; font-size: 12px;">{row['Nama_Bandara']}</p>
-            </div>
-            <div style="padding: 15px; background-color: #f8f9fa; border: 1px solid #ddd; border-top: none;">
-                
-                <div style="margin-bottom: 10px; border-left: 4px solid {l2_res['color']}; padding-left: 10px;">
-                    <span style="font-size: 11px; font-weight: bold; color: #555;">EVALUASI TAF AKTUAL</span><br>
-                    <span style="font-size: 14px; font-weight: bold; color: {l2_res['color']};">{l2_res['status']}</span>
-                    <ul style="margin: 5px 0 0 0; padding-left: 15px; font-size: 11px; color: #333;">{l2_html}</ul>
-                </div>
-                
-                <hr style="border: 0; border-top: 1px solid #ccc; margin: 10px 0;">
-                
-                <div style="max-height: 160px; overflow-y: auto; font-size: 11px;">
-                    <p style="margin: 0 0 5px 0; color: #004085; font-weight:bold;">[ METAR AKTUAL ]</p>
-                    <div style="background: #e9ecef; padding: 6px; border-radius: 4px; font-family: monospace; margin-bottom: 10px; overflow-x: auto;">{curr_metar}</div>
-                    <p style="margin: 0 0 5px 0; color: #856404; font-weight:bold;">[ LAPORAN SPECI ]</p>
-                    <div style="background: #fff3cd; padding: 6px; border-radius: 4px; font-family: monospace; margin-bottom: 10px; overflow-x: auto;">{speci_alert_str}</div>
-                    <p style="margin: 0 0 5px 0; color: #155724; font-weight:bold;">[ PRAKIRAAN TAF TERBARU ]</p>
-                    <div style="background: #d4edda; padding: 6px; border-radius: 4px; font-family: monospace; margin-bottom: 10px; overflow-x: auto;">{taf_str}</div>
-                </div>
-
-                {nwp_section}
-
-            </div>
-        </div>
-        """
-        
-        station_features.append({'type': 'Feature', 'geometry': {'type': 'Point', 'coordinates': [row['Bujur'], row['Lintang']]},
-            'properties': {'time': grid_time.isoformat(), 'popup': popup_html, 'icon': 'circle',
-            'iconstyle': {'fillColor': color if color != '#D4AC0D' else '#F1C40F', 'fillOpacity': 0.85, 'stroke': 'true', 'color': 'white', 'weight': 1.5, 'radius': 9}}})
-            
-    return station_features, station_alerts
-
-# ==========================================
-# 6. PEMBUATAN PETA
+# 5. PEMBUATAN PETA (BULDOSER / SEKUENSIAL)
 # ==========================================
 def create_dynamic_webgis(df):
     m = folium.Map(location=[-2.5, 118.0], zoom_start=5, tiles='cartodbdark_matter')
@@ -587,20 +460,130 @@ def create_dynamic_webgis(df):
     grid_times = [latest_grid - timedelta(minutes=30 * i) for i in range(2)]
     grid_times.reverse() 
 
-    print(f"🚀 Memproses {len(df)} Bandara (Looping Sekuensial Anti-Blokir)...")
+    print(f"🚀 Memproses {len(df)} Bandara (Looping Sekuensial + Proxy Anti-Blokir)...")
     for index, row in df.iterrows():
-        try:
-            f_list, a_list = process_airport(row, grid_times)
-            all_features.extend(f_list)
-            all_telegram_alerts.extend(a_list)
-        except Exception as e:
-            print(f"❌ Terjadi Error pada {row['ICAO']}: {e}")
+        icao = row['ICAO']
+        
+        # Jeda anti-spam yang lebih panjang untuk GitHub Actions
+        time.sleep(random.uniform(1.5, 3.0))
+
+        metars = get_weather_data(icao, 'metar', 45)
+        specis = get_weather_data(icao, 'speci', 20)
+        tafs = get_weather_data(icao, 'taf', 1)
+        taf_str = tafs[0] if len(tafs) > 0 else "NIL"
+        
+        if metars:
+            print(f"✅ {icao} Berhasil ditarik")
+        else:
+            print(f"❌ {icao} Kosong")
+            continue # Langsung skip jika kosong agar tidak memberatkan peta
             
+        parsed_metars = [ (extract_time_components(m), m) for m in metars if extract_time_components(m) ]
+        parsed_specis = [ (extract_time_components(s), s) for s in specis if extract_time_components(s) ]
+
+        final_color = 'green'
+        final_reasons = []
+        for grid_time in grid_times:
+            curr_metar = find_closest_data_by_grid_logic(grid_time, parsed_metars)
+            has_speci = any(0 <= (grid_time.hour * 60 + grid_time.minute) - (comp['hour'] * 60 + comp['minute']) <= 30 for comp, _ in parsed_specis if comp)
+            c, l2_res, _ = evaluate_snapshot(curr_metar, taf_str, grid_time, has_speci)
+            if grid_time == grid_times[-1]: 
+                final_color = c
+                final_reasons = l2_res['reasons']
+
+        nwp_html, nwp_tg = get_nwp_forecast(row['Lintang'], row['Bujur'], final_color, final_reasons)
+
+        nwp_section = ""
+        if nwp_html:
+            nwp_section = f"""
+            <details style="margin-top: 15px; margin-bottom: 10px; background: #ffffff; border: 1px solid #17a2b8; border-radius: 5px;">
+                <summary style="padding: 8px 10px; font-size: 11px; font-weight: bold; color: #0c5460; background-color: #d1ecf1; cursor: pointer; outline: none; border-radius: 4px;">
+                    📊 PERTIMBANGAN MODEL NWP (Klik untuk buka)
+                </summary>
+                <div style="padding: 10px; font-size: 10px; line-height: 1.5; white-space: nowrap; overflow-x: auto;">
+                    {nwp_html}
+                </div>
+            </details>
+            """
+
+        for grid_time in grid_times:
+            curr_metar = find_closest_data_by_grid_logic(grid_time, parsed_metars)
+            
+            target_mins = grid_time.hour * 60 + grid_time.minute
+            speci_alert_str = "NIL (Tidak ada SPECI relevan)"
+            has_speci = False
+            for comp, s_str in parsed_specis:
+                data_mins = comp['hour'] * 60 + comp['minute']
+                diff = target_mins - data_mins
+                if diff < -720: diff += 1440
+                elif diff > 720: diff -= 1440
+                if 0 <= diff <= 30:
+                    has_speci, speci_alert_str = True, s_str
+                    break
+            
+            color, l2_res, wind_dir_int = evaluate_snapshot(curr_metar, taf_str, grid_time, has_speci)
+            
+            if grid_time == grid_times[-1] and color == 'red':
+                alasan = "\n- ".join(l2_res['reasons'])
+                waktu_generate = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
+                pesan_alert = (
+                    f"🚨 <b>{icao} ({row['Nama_Bandara']})</b>\n"
+                    f"⏱ <b>Waktu Generate:</b> {waktu_generate}\n"
+                    f"<b>Status:</b> REKOMENDASI AMD TAF\n"
+                    f"<b>Penyebab:</b>\n- {alasan}\n\n"
+                    f"<b>[ METAR AKTUAL ]</b>\n<code>{curr_metar}</code>\n\n"
+                    f"<b>[ TAF TERBARU ]</b>\n<code>{taf_str}</code>\n\n"
+                    f"<b>[ 🤖 ASISTEN TAF ]</b>\n{nwp_tg}"
+                )
+                all_telegram_alerts.append(pesan_alert)
+
+            l2_html = "".join([f"<li>{r}</li>" for r in l2_res['reasons']])
+            curr_comp = extract_time_components(curr_metar)
+            jam_label = f"{curr_comp['hour']:02d}:{curr_comp['minute']:02d} UTC" if curr_comp else grid_time.strftime("%H:%M UTC")
+            
+            popup_html = f"""
+            <div style="max-width: 380px; min-width: 250px; width: max-content; font-family: Arial, sans-serif; white-space: normal;">
+                <div style="background-color: {color if color != '#D4AC0D' else '#D4AC0D'}; color: {'black' if color == '#D4AC0D' else 'white'}; padding: 10px; border-radius: 5px 5px 0 0; text-align: center;">
+                    <h4 style="margin: 0; font-weight: bold;">{icao} <span style="font-size:12px; font-weight:normal;">({jam_label})</span></h4>
+                    <p style="margin: 5px 0 0 0; font-size: 12px;">{row['Nama_Bandara']}</p>
+                </div>
+                <div style="padding: 15px; background-color: #f8f9fa; border: 1px solid #ddd; border-top: none;">
+                    
+                    <div style="margin-bottom: 10px; border-left: 4px solid {l2_res['color']}; padding-left: 10px;">
+                        <span style="font-size: 11px; font-weight: bold; color: #555;">EVALUASI TAF AKTUAL</span><br>
+                        <span style="font-size: 14px; font-weight: bold; color: {l2_res['color']};">{l2_res['status']}</span>
+                        <ul style="margin: 5px 0 0 0; padding-left: 15px; font-size: 11px; color: #333;">{l2_html}</ul>
+                    </div>
+                    
+                    <hr style="border: 0; border-top: 1px solid #ccc; margin: 10px 0;">
+                    
+                    <div style="max-height: 160px; overflow-y: auto; font-size: 11px;">
+                        <p style="margin: 0 0 5px 0; color: #004085; font-weight:bold;">[ METAR AKTUAL ]</p>
+                        <div style="background: #e9ecef; padding: 6px; border-radius: 4px; font-family: monospace; margin-bottom: 10px; overflow-x: auto;">{curr_metar}</div>
+                        <p style="margin: 0 0 5px 0; color: #856404; font-weight:bold;">[ LAPORAN SPECI ]</p>
+                        <div style="background: #fff3cd; padding: 6px; border-radius: 4px; font-family: monospace; margin-bottom: 10px; overflow-x: auto;">{speci_alert_str}</div>
+                        <p style="margin: 0 0 5px 0; color: #155724; font-weight:bold;">[ PRAKIRAAN TAF TERBARU ]</p>
+                        <div style="background: #d4edda; padding: 6px; border-radius: 4px; font-family: monospace; margin-bottom: 10px; overflow-x: auto;">{taf_str}</div>
+                    </div>
+
+                    {nwp_section}
+
+                </div>
+            </div>
+            """
+            
+            all_features.append({'type': 'Feature', 'geometry': {'type': 'Point', 'coordinates': [row['Bujur'], row['Lintang']]},
+                'properties': {'time': grid_time.isoformat(), 'popup': popup_html, 'icon': 'circle',
+                'iconstyle': {'fillColor': color if color != '#D4AC0D' else '#F1C40F', 'fillOpacity': 0.85, 'stroke': 'true', 'color': 'white', 'weight': 1.5, 'radius': 9}}})
+            
+    if not all_features:
+        return None, [] # Jika kosong semua, kembalikan None agar tidak render peta kosong
+        
     plugins.TimestampedGeoJson({'type': 'FeatureCollection', 'features': all_features}, period='PT30M', add_last_point=True, auto_play=False, loop=False, max_speed=1, time_slider_drag_update=True, duration='PT30M').add_to(m)
     return m, all_telegram_alerts
 
 # ==========================================
-# 7. UPLOAD GITHUB & TELEGRAM
+# 6. UPLOAD GITHUB & TELEGRAM
 # ==========================================
 def push_to_github(html_string, token, repo, path="index.html"):
     print("\n[Upload] Mengirim Peta WiraAvia ke GitHub...")
@@ -647,24 +630,27 @@ def send_telegram_alert(token, chat_id, alerts_list, repo):
     print("📲 Semua Notifikasi Telegram berhasil diproses!")
 
 # ==========================================
-# 8. RUN SCRIPT
+# 7. RUN SCRIPT
 # ==========================================
 if __name__ == "__main__":
     print("==================================================")
-    print("MENGHIDUPKAN WIRAAVIA (Sistem Final Anti-Error & Directional Parser)")
+    print("MENGHIDUPKAN WIRAAVIA (Sistem Bypass WAF BMKG + Proxy Routing)")
     print("==================================================")
     mulai = time.time()
     
     dashboard_map, alert_messages = create_dynamic_webgis(df_bandara)
     
-    html_string = dashboard_map.get_root().render()
-    if GITHUB_TOKEN:
-        push_to_github(html_string, GITHUB_TOKEN, GITHUB_REPO)
+    if dashboard_map:
+        html_string = dashboard_map.get_root().render()
+        if GITHUB_TOKEN:
+            push_to_github(html_string, GITHUB_TOKEN, GITHUB_REPO)
+        else:
+            print("⚠️ Token GitHub tidak ditemukan. Peta tidak diupload.")
+        
+        if TELEGRAM_BOT_TOKEN:
+            send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, alert_messages, GITHUB_REPO)
     else:
-        print("⚠️ Token GitHub tidak ditemukan. Peta tidak diupload.")
-    
-    if TELEGRAM_BOT_TOKEN:
-        send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, alert_messages, GITHUB_REPO)
+        print("❌ Pembuatan peta dibatalkan karena seluruh data BMKG gagal ditarik.")
     
     durasi = time.time() - mulai
     print("==================================================")
