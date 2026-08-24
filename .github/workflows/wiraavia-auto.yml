@@ -2,13 +2,13 @@ name: WiraAvia Auto Update
 
 on:
   schedule:
-    # Berjalan otomatis setiap menit ke-10 dan ke-40 setiap jam (Memberi waktu BMKG rilis data)
     - cron: '10,40 * * * *'
-  workflow_dispatch: # Memunculkan tombol agar bisa dijalankan manual kapan saja
+  workflow_dispatch: 
 
 jobs:
   update-map:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
@@ -21,7 +21,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas folium requests urllib3
+          pip install pandas folium curl_cffi
           
       - name: Jalankan AI WiraAvia
         env:
