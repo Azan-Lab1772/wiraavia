@@ -1,3 +1,5 @@
 pandas
 folium
 requests
+urllib3
+streamlit
